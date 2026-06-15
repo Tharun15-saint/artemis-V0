@@ -1,0 +1,35 @@
+# Database — never upload this
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment variables and API keys — never upload
+.env
+.env.local
+*.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Cursor AI files (optional — keep if you want)
+# .cursor/
+
+# Large data files
+*.xlsx
+*.pdf
+*.csv
+
+# Logs
+*.log

@@ -1,0 +1,77 @@
+---
+description: Artemis project rules
+alwaysApply: true
+---
+
+You are working on Artemis — an apparel supply chain intelligence and execution platform.
+
+THE SCHEMA IS THE CONTRACT
+Every model, endpoint, and function must match docs/MASTER_SCHEMA.md exactly.
+Do not invent tables. Do not invent fields. Do not change field types.
+Database is SQLite at artemis.db. All models are in database/models/.
+Every model must have created_at and updated_at.
+PRAGMA foreign_keys = ON on every connection.
+
+THE CENTRAL ENTITY
+PROGRAM links one IMPORTER to one CMT_FACTORY for one PRODUCT_SPECIFICATION.
+Every feature is scoped to a program. Never create orphaned records.
+
+THE FOUR EXECUTION FLOWS
+1. COMMODITY HEDGING via Pillar HQ
+Trigger: cotton.contango_signal > 5.0 AND program.commodity_hedge_status = UNHEDGED
+Creates hedge_opportunity, executes via Pillar HQ API, creates hedge_portfolio
+Logs revenue_transaction type hedge_share
+
+2. OCEAN FREIGHT REVERSE AUCTION
+Trigger: ship_date within 45 days AND program.freight_booking_id IS NULL
+Creates ocean_freight_rfq, broadcasts to carriers, receives carrier_bid records
+Logs revenue_transaction type freight_booking
+
+3. CUSTOMS CLEARANCE via Customs Broker Partner
+Trigger: program.status = SHIPPED AND customs_clearance_id IS NULL
+Creates customs_clearance_filing, duty_amount_paid feeds back to landed_cost_actual
+Logs revenue_transaction type customs_referral
+
+4. SUPPLY CHAIN FINANCE via SCF Provider
+Trigger: program.status = COMMITTED AND financing_rate_annual_pct > 10.0
+Creates supply_chain_finance_offer, revenue fires on disbursement_date only
+Logs revenue_transaction type scf_spread
+
+FOB FORMULA
+FOB = fabric_cost_doz + cmt_cost_doz + trim_cost_doz + overhead_doz + financing_cost_doz
+financing_cost_doz = fob_approx x rate_pct/100 x payment_days/365
+payment_days: Bangladesh=90 India=90 Vietnam=90 China=60
+financing_cost_doz always stored separately, never rolled into overhead
+
+15 INTELLIGENCE OUTPUTS
+Every output needs as_of_date and model_version. Every output writes a prediction_log.
+Tables: current_landed_cost_per_dozen, forward_landed_cost_90day,
+most_cost_effective_corridor, commodity_risk_in_open_programs,
+hedge_opportunity_recommendation, top5_competitor_sourcing,
+retailer_demand_forecast, tariff_exposure_analysis, factory_financing_impact,
+factory_capacity_constraints, otd_risk_score_per_program, freight_booking_window,
+scf_opportunity_per_factory, competitor_factory_intel, program_pnl_with_levers
+
+DATA DISCIPLINE — NON-NEGOTIABLE
+Rule 1 — APPEND ONLY: Never overwrite market data rows. Call mark_latest() in database/base.py before every insert. Append-only tables: cotton, crude_oil, fx_rates, commodity_futures, ocean_freight_rates, retailer_financials, retailer_intelligence_extract, retailer_signal_evidence, labour_cost_by_country, energy_cost, factory_financing_cost, yarn.
+Rule 2 — LOG EVERY PULL: Every ingestion script uses IngestionContext from database/ingestion_context.py. Every run writes an ingestion_log row. Status: running | success | partial | failed.
+Rule 3 — VALIDATE ON INGESTION: Fields with validators in database/validation/ingestion_validators.py must pass through validate_and_log(). Failures store NULL, never bad data.
+Rule 4 — IDEMPOTENCY: Call is_duplicate_row() in database/base.py before every insert. If True, ctx.stale() and skip.
+Rule 5 — REFERENTIAL INTEGRITY: Call assert_fk_exists() in database/base.py before FK writes. If False, ctx.rejected().
+Rule 6 — SOURCE FINGERPRINTING: Every append-only row must have source, data_source_url, pulled_at (all NOT NULL).
+Rule 7 — MODEL VERSION: Intelligence outputs use CURRENT_MODEL_VERSION from database/constants.py in x.y.z format.
+HEALTH CHECK: Run python scripts/health_check.py after every ingestion cycle.
+
+OCEAN FREIGHT CONTAINER TYPES
+20ft standard — dense/heavy cargo, smaller programs (rate_20ft_usd)
+40ft standard — primary apparel container (rate_40ft_usd)
+40ft High Cube — bulky cartons and hanger programs (rate_40ft_hc_usd)
+
+HARD RULES
+No pandas for database work. SQLAlchemy ORM only.
+No hardcoded corridor strings. Use CORRIDORS from database/constants.py.
+No String type for rates or amounts. Always Numeric or Decimal.
+No intelligence logic inside API route handlers.
+No raw database objects from API. Always serialize.
+No landed_cost_actual until duty_amount_paid confirmed.
+No scf revenue until disbursement_date is set.

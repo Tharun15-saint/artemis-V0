@@ -1,0 +1,163 @@
+# ARTEMIS — CURSOR PROJECT RULES
+# These rules apply to every file, every feature, every prompt in this project.
+# Read this fully before responding to any request.
+
+## WHAT THIS PROJECT IS
+
+Artemis is an apparel supply chain intelligence and execution platform.
+Four planes every piece of code must serve:
+
+  PLANE A — INTELLIGENCE    reads market data, surfaces signals
+  PLANE B — EXECUTION       acts on signals, facilitates transactions
+  PLANE C — NETWORK         connects importers and manufacturers
+  PLANE D — REVENUE         logs every monetisation event
+
+## THE MASTER SCHEMA IS THE CONTRACT
+
+Every model, endpoint, and function must match docs/MASTER_SCHEMA.md exactly.
+Do not invent tables. Do not invent fields. Do not change field types.
+If a feature needs a field not in the schema, STOP and flag it. Never add silently.
+
+## DATABASE
+
+- SQLite via SQLAlchemy 2.0
+- File: artemis.db at project root
+- All models in: database/models/
+- Every model must have created_at and updated_at
+- PRAGMA foreign_keys = ON on every connection
+- Never use raw SQL strings. SQLAlchemy ORM only.
+
+## THE CENTRAL ENTITY IS PROGRAM
+
+Every intelligence output, execution action, and revenue event is scoped
+to a PROGRAM. Program links one IMPORTER to one CMT_FACTORY for one
+PRODUCT_SPECIFICATION. Never create orphaned records.
+
+## THE FOUR EXECUTION FLOWS
+
+1. COMMODITY HEDGING (Pillar HQ)
+   Trigger: cotton.contango_signal > 5.0 AND program.commodity_hedge_status = UNHEDGED
+   Creates: hedge_opportunity record
+   Executes: POST /pillar/quote then POST /pillar/execute
+   Creates: hedge_portfolio record
+   Updates: program.commodity_hedge_status = HEDGED
+   Logs: revenue_transaction type hedge_share
+   Feeds back: forward_landed_cost_90day updated with locked price
+
+2. OCEAN FREIGHT REVERSE AUCTION (Carrier Network)
+   Trigger: ship_date within 45 days AND freight_booking_id IS NULL
+   Creates: ocean_freight_rfq auto-populated from program
+   Broadcasts: to carrier API network
+   Receives: carrier_bid records
+   Awards: rfq.status = AWARDED, award_timestamp set
+   Logs: revenue_transaction type freight_booking
+
+3. CUSTOMS CLEARANCE (Customs Broker Partner)
+   Trigger: program.status = SHIPPED AND customs_clearance_id IS NULL
+   Creates: customs_clearance_filing auto-populated from program
+   Updates: duty_amount_paid feeds back to program.landed_cost_actual
+   Logs: revenue_transaction type customs_referral
+
+4. SUPPLY CHAIN FINANCE (SCF Provider)
+   Trigger: program.status = COMMITTED AND factory financing_rate > 10.0
+   Creates: supply_chain_finance_offer
+   Logs: revenue_transaction type scf_spread ON DISBURSEMENT ONLY
+
+## 15 INTELLIGENCE OUTPUT TABLES
+
+current_landed_cost_per_dozen
+forward_landed_cost_90day
+most_cost_effective_corridor
+commodity_risk_in_open_programs
+hedge_opportunity_recommendation
+top5_competitor_sourcing
+retailer_demand_forecast
+tariff_exposure_analysis
+factory_financing_impact
+factory_capacity_constraints
+otd_risk_score_per_program
+freight_booking_window
+scf_opportunity_per_factory
+competitor_factory_intel
+program_pnl_with_levers
+
+Every output must include as_of_date and model_version.
+Every output must also write a prediction_log record.
+
+## DATA QUALITY RULES
+
+Cotton:        stale if as_of_date older than 2 days
+FX rates:      stale if as_of_date older than 2 days
+Crude oil:     warn above 5 days, error above 7 days
+Ocean freight: stale above 8 days
+Yarn:          confidence_score 0.68 currently (priors only, no real data yet)
+
+## FOB FORMULA
+
+FOB = fabric_cost_doz + cmt_cost_doz + trim_cost_doz + overhead_doz + financing_cost_doz
+financing_cost_doz = (fob_approx x rate_pct/100) x (payment_days/365)
+payment_days: Bangladesh 90, India 90, Vietnam 90, China 60
+financing_cost_doz is ALWAYS stored separately. Never rolled into overhead.
+
+## REVENUE TYPES
+
+subscription, hedge_share, freight_booking, drayage_booking,
+intermodal_booking, customs_referral, scf_spread, data_licensing
+
+## DATA DISCIPLINE — NON-NEGOTIABLE
+
+Rule 1 — APPEND ONLY:
+  Never overwrite existing rows in market data tables.
+  Always call mark_latest() before inserting, then insert a new row.
+  mark_latest() is in database/base.py.
+  Tables that are append-only: cotton, crude_oil, fx_rates,
+  commodity_futures, ocean_freight_rates, retailer_financials,
+  retailer_intelligence_extract, retailer_signal_evidence,
+  labour_cost_by_country, energy_cost, factory_financing_cost, yarn.
+
+Rule 2 — LOG EVERY PULL:
+  Every ingestion script must use IngestionContext from
+  database/ingestion_context.py.
+  No ingestion run completes without a log row in ingestion_log.
+  Status must be one of: 'running' | 'success' | 'partial' | 'failed'.
+
+Rule 3 — VALIDATE ON INGESTION:
+  Every field that has a validator in database/validation/ingestion_validators.py
+  must be passed through validate_and_log() before being stored.
+  A validation failure stores NULL rather than bad data.
+  Never let a bad value enter the database silently.
+
+Rule 4 — IDEMPOTENCY:
+  Before every insert, call is_duplicate_row() from database/base.py.
+  If True, call ctx.stale() and skip the insert. Never create duplicate rows.
+
+Rule 5 — REFERENTIAL INTEGRITY:
+  Before writing FK rows, call assert_fk_exists() from database/base.py.
+  If False, call ctx.rejected() and do not insert.
+
+Rule 6 — SOURCE FINGERPRINTING:
+  Every append-only row must populate source, data_source_url, and pulled_at.
+  source and data_source_url are NOT NULL on all append-only tables.
+
+Rule 7 — MODEL VERSION:
+  All intelligence output rows must have model_version in x.y.z format.
+  Use CURRENT_MODEL_VERSION from database/constants.py.
+
+HEALTH CHECK:
+  Run python scripts/health_check.py after every ingestion cycle.
+
+OCEAN FREIGHT CONTAINER TYPES:
+  20ft standard  — dense/heavy cargo, smaller programs (rate_20ft_usd)
+  40ft standard  — primary apparel container (rate_40ft_usd)
+  40ft High Cube — bulky cartons and hanger programs (rate_40ft_hc_usd)
+
+## NEVER DO
+
+- No pandas for database work
+- No hardcoded corridor strings, use CORRIDORS from constants.py
+- No intelligence logic inside API route handlers
+- No raw database objects returned from API
+- No skipping prediction_log when writing intelligence output
+- No landed_cost_actual set before customs duty is confirmed
+- No scf revenue logged before disbursement_date is set
+- No String type for rates or amounts, always Numeric or Decimal
