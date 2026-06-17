@@ -1,38 +1,49 @@
-from sqlalchemy import Boolean, Column, Date, DateTime, Integer, Numeric, String, Text
+from sqlalchemy import BigInteger, Boolean, Column, Date, DateTime, Integer, Numeric, String, Text
 from sqlalchemy.sql import func
 from database.base import Base
 
 
 class MajorRetailers(Base):
+    """Identity/master table — one row per retailer, never carries financial data.
+    Financial data lives in RetailerFinancials (temporal, append-only).
+    """
     __tablename__ = "major_retailers"
-    retailer_id         = Column(Integer, primary_key=True)
-    name                = Column(String(255))
-    store_count         = Column(Integer)
-    total_sales         = Column(Numeric(14, 2))
-    apparel_revenue     = Column(Numeric(14, 2))
-    gross_margin        = Column(Numeric(6, 2))
-    inventory_turnover  = Column(Numeric(8, 2))
-    forward_guidance    = Column(String(255))
-    source              = Column(String(255))
-    status              = Column(String(50))
-    retailer_type       = Column(String(50))
-    retailer_sub_type   = Column(String(100))
-    demand_signal_interpretation = Column(Text)
-    created_at          = Column(DateTime, server_default=func.now(), nullable=False)
-    updated_at          = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+    retailer_id       = Column(Integer, primary_key=True)
+    name              = Column(String(255))
+    cik               = Column(String(15))
+    ticker            = Column(String(10))
+    source            = Column(String(255))
+    status            = Column(String(50))
+    retailer_type     = Column(String(50))
+    retailer_sub_type = Column(String(100))
+    created_at        = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at        = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
 class DemandSignals(Base):
+    """Derived categorical signals per retailer per reporting period.
+    Append-only: new row per (retailer_id, fiscal_year, fiscal_quarter); old rows demoted via is_latest=False.
+    """
     __tablename__ = "demand_signals"
-    demand_signal_id     = Column(Integer, primary_key=True)
-    retailer_id          = Column(Integer)
-    store_expansion      = Column(String(255))
-    inventory_improving  = Column(String(255))
-    margin_compression   = Column(String(255))
-    buying_volume_signal = Column(String(255))
-    status               = Column(String(50))
-    created_at           = Column(DateTime, server_default=func.now(), nullable=False)
-    updated_at           = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+    demand_signal_id    = Column(Integer, primary_key=True)
+    retailer_id         = Column(Integer)
+    fiscal_year         = Column(Integer)
+    fiscal_quarter      = Column(Integer)
+    period_end_date     = Column(Date)
+    store_expansion     = Column(String(20))
+    inventory_improving = Column(String(20))
+    margin_compression  = Column(String(20))
+    buying_volume_signal = Column(String(30))
+    revenue_growth_pct  = Column(Numeric(8, 4))
+    turnover_change_pct = Column(Numeric(8, 4))
+    margin_change_pct   = Column(Numeric(8, 4))
+    status              = Column(String(50))
+    source              = Column(String(100), nullable=False, server_default="unknown")
+    data_source_url     = Column(String(500), nullable=False, server_default="unknown")
+    is_latest           = Column(Boolean, nullable=False, default=True, server_default="1")
+    pulled_at           = Column(DateTime, nullable=False, server_default=func.now())
+    created_at          = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at          = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
 class SeasonalPatterns(Base):
@@ -65,15 +76,18 @@ class RetailerFinancials(Base):
     gross_margin_pct            = Column(Numeric(6, 4))
     gross_margin_change_bps     = Column(Numeric(8, 2))
     sga_rate_pct                = Column(Numeric(6, 4))
+    operating_income_usd        = Column(Numeric(18, 2))
     operating_margin_pct        = Column(Numeric(6, 4))
+    net_income_usd              = Column(Numeric(18, 2))
+    net_margin_pct              = Column(Numeric(6, 4))
     inventory_usd               = Column(Numeric(14, 2))
     inventory_days              = Column(Numeric(8, 2))
     store_count_total           = Column(Integer)
     store_count_net_change      = Column(Integer)
     ecommerce_penetration_pct   = Column(Numeric(6, 4))
     guidance_sales_direction    = Column(String(50))
-    guidance_sales_range_low    = Column(Numeric(6, 4))
-    guidance_sales_range_high   = Column(Numeric(6, 4))
+    guidance_sales_range_low    = Column(Numeric(12, 4))
+    guidance_sales_range_high   = Column(Numeric(12, 4))
     guidance_eps_low            = Column(Numeric(8, 2))
     guidance_eps_high           = Column(Numeric(8, 2))
     source_10q_url              = Column(String(500))
@@ -94,7 +108,7 @@ class RetailerFinancials(Base):
     walmart_us_store_count              = Column(Integer)
     sams_club_count                     = Column(Integer)
     walmart_us_model_note               = Column(String(200))
-    sams_club_model_note                = Column(String(200))
+    sams_club_model_note                = Column(String(500))
     walmart_us_inventory_usd            = Column(Numeric(14, 2))
     sams_club_inventory_usd             = Column(Numeric(14, 2))
     walmart_international_inventory_usd = Column(Numeric(14, 2))
@@ -140,6 +154,8 @@ class RetailerIntelligenceExtract(Base):
     document_section        = Column(String(100))
     source_url              = Column(String(500))
     signal_category         = Column(String(100))
+    canonical_category      = Column(String(100))  # FK → signal_category_taxonomy.canonical_category
+    business_segment        = Column(String(40))  # enterprise | walmart_us | sams_club | target_us
     raw_text_passage        = Column(Text)
     extracted_signal        = Column(String(500))
     signal_sentiment        = Column(String(20))
@@ -152,7 +168,7 @@ class RetailerIntelligenceExtract(Base):
     speaker                 = Column(String(20))
     is_forward_looking      = Column(Boolean)
     contains_number         = Column(Boolean)
-    number_mentioned        = Column(String(50))
+    number_mentioned        = Column(String(255))
     time_period_referenced  = Column(String(30))
     affected_decision       = Column(String(50))
     time_horizon            = Column(String(30))
@@ -173,7 +189,7 @@ class RetailerIntelligenceExtract(Base):
     data_source_url         = Column(String(500), nullable=False, server_default="unknown")
     pulled_at               = Column(DateTime, nullable=False, server_default=func.now())
     is_latest               = Column(Boolean, nullable=False, default=True, server_default="1")
-    excluded_reason         = Column(String(100))
+    excluded_reason         = Column(String(500))
     created_at              = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at              = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -195,7 +211,7 @@ class RetailerSignalEvidence(Base):
     raw_text_passage        = Column(Text)
     is_forward_looking      = Column(Boolean)
     contains_number         = Column(Boolean)
-    number_mentioned        = Column(String(50))
+    number_mentioned        = Column(String(255))
     time_period_referenced  = Column(String(30))
     extraction_confidence   = Column(Numeric(4, 2))
     document_priority       = Column(Integer)
@@ -207,6 +223,37 @@ class RetailerSignalEvidence(Base):
     data_source_url         = Column(String(500), nullable=False, server_default="unknown")
     pulled_at               = Column(DateTime, nullable=False, server_default=func.now())
     is_latest               = Column(Boolean, nullable=False, default=True, server_default="1")
-    excluded_reason         = Column(String(100))
+    excluded_reason         = Column(String(500))
     created_at              = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at              = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class RetailerStockPrices(Base):
+    """Daily equity OHLCV time series per retailer — the market's forward view.
+
+    Append-only: one row per (retailer_id, price_date); on re-ingest the prior
+    is_latest=True row for that day is demoted. Only cleanly-extractable fields
+    are stored (OHLC, VWAP, volume, pct_change); derivative tail fields from the
+    source ($Chg / trade value / trade count) are intentionally NOT stored rather
+    than fabricated. Prices are split-adjusted by the source vendor.
+    """
+    __tablename__ = "retailer_stock_prices"
+    stock_price_id   = Column(Integer, primary_key=True, autoincrement=True)
+    retailer_id      = Column(Integer)          # FK → major_retailers
+    ticker           = Column(String(10))
+    price_date       = Column(Date, nullable=False, primary_key=True)
+    open_price       = Column(Numeric(12, 4))
+    high_price       = Column(Numeric(12, 4))
+    low_price        = Column(Numeric(12, 4))
+    close_price      = Column(Numeric(12, 4), nullable=False)
+    vwap             = Column(Numeric(12, 4))
+    volume           = Column(BigInteger)
+    pct_change       = Column(Numeric(8, 4))
+    is_split_adjusted = Column(Boolean, nullable=False, server_default="1")
+    data_quality     = Column(String(200))      # flags vendor anomalies; never imputed
+    source           = Column(String(100), nullable=False, server_default="unknown")
+    data_source_url  = Column(String(500), nullable=False, server_default="unknown")
+    pulled_at        = Column(DateTime, nullable=False, server_default=func.now())
+    is_latest        = Column(Boolean, nullable=False, default=True, server_default="1")
+    created_at       = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at       = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)

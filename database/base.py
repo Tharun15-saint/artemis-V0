@@ -7,6 +7,7 @@ Every session has foreign keys enforced.
 from decimal import Decimal
 
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from dotenv import load_dotenv
 import os
@@ -15,20 +16,44 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./artemis.db")
 
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False},  # SQLite only
-    echo=False,  # Set True temporarily to debug SQL
-)
+# Single source of truth for the engine. The dialect is detected from the URL so
+# the exact same code runs against SQLite (local/legacy) and PostgreSQL/Timescale
+# (production) — see scripts/migrate_sqlite_to_postgres.py.
+_url = make_url(DATABASE_URL)
+IS_SQLITE = _url.get_backend_name() == "sqlite"
 
-# Enforce foreign key constraints on every connection
-# SQLite disables these by default — this turns them on
-@event.listens_for(engine, "connect")
-def set_sqlite_pragma(dbapi_connection, connection_record):
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.execute("PRAGMA journal_mode=WAL")  # Better concurrent reads
-    cursor.close()
+if IS_SQLITE:
+    # SQLite: single-file DB, allow cross-thread use (FastAPI), no real pool.
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args={"check_same_thread": False},
+        echo=False,  # Set True temporarily to debug SQL
+    )
+else:
+    # PostgreSQL / TimescaleDB: real connection pool with liveness checks so a
+    # dropped server connection is transparently recycled rather than erroring.
+    engine = create_engine(
+        DATABASE_URL,
+        pool_size=int(os.getenv("DB_POOL_SIZE", "10")),
+        max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "20")),
+        pool_timeout=30,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        echo=False,
+    )
+
+
+# Enforce foreign key constraints on every connection.
+# SQLite disables FK enforcement by default — this turns it on. PostgreSQL
+# enforces foreign keys natively, so this listener is registered for SQLite only.
+if IS_SQLITE:
+
+    @event.listens_for(engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")  # Better concurrent reads
+        cursor.close()
 
 
 class Base(DeclarativeBase):

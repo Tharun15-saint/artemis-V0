@@ -11,7 +11,7 @@ from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from data.ingestion._env import load_project_env
-from database.base import SessionLocal, is_duplicate_row, mark_latest
+from database.base import SessionLocal, is_duplicate_row
 from database.ingestion_context import IngestionContext
 from database.models import FxRates
 from database.validation.ingestion_validators import (
@@ -32,6 +32,12 @@ SOURCE_NAME = "fx_rates_exchangerate_api"
 SOURCE_SYSTEM = "exchangerate_api"
 DATA_SOURCE_URL_TEMPLATE = "https://v6.exchangerate-api.com/v6/{api_key}/latest/USD"
 
+# Live-ingestion source lineage. is_latest is tracked PER data product: the live
+# daily product (these sources) and the historical weekly product
+# (yfinance_historical_weekly / FRED fallback, owned by fx_historical_backfill.py)
+# each maintain their own is_latest series and must never demote each other.
+LIVE_SOURCES = ("exchangerate_api", "AlphaVantage_fallback")
+
 EXCHANGE_RATE_API_KEY = os.getenv("EXCHANGE_RATE_API_KEY", "")
 ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
 
@@ -44,13 +50,24 @@ AV_FALLBACK_URL = (
     f"&apikey={ALPHA_VANTAGE_KEY}"
 )
 
+# (field_on_model, validation_pair, invert_api_rate)
+# ExchangeRate-API returns "X per 1 USD" for all codes.
+# EUR and GBP are quoted "USD per 1 EUR/GBP" in our schema — so we invert.
 CURRENCY_TO_FIELD = {
-    "INR": ("usd_inr", "USD_INR"),
-    "BDT": ("usd_bdt", "USD_BDT"),
-    "VND": ("usd_vnd", "USD_VND"),
-    "CNY": ("usd_cny", "USD_CNY"),
-    "TRY": ("usd_try", "USD_TRY"),
-    "PKR": ("usd_pkr", "USD_PKR"),
+    "INR": ("usd_inr", "USD_INR", False),
+    "BDT": ("usd_bdt", "USD_BDT", False),
+    "VND": ("usd_vnd", "USD_VND", False),
+    "CNY": ("usd_cny", "USD_CNY", False),
+    "TRY": ("usd_try", "USD_TRY", False),
+    "MAD": ("usd_mad", "USD_MAD", False),
+    "PKR": ("usd_pkr", "USD_PKR", False),
+    "IDR": ("usd_idr", "USD_IDR", False),
+    "LKR": ("usd_lkr", "USD_LKR", False),
+    "MXN": ("usd_mxn", "USD_MXN", False),
+    "THB": ("usd_thb", "USD_THB", False),
+    "KHR": ("usd_khr", "USD_KHR", False),
+    "EUR": ("eur_usd", "EUR_USD", True),   # inverted: API gives USD/EUR
+    "GBP": ("gbp_usd", "GBP_USD", True),   # inverted: API gives USD/GBP
 }
 
 SCHEDULE_INTERVAL_HOURS = 6
@@ -62,10 +79,11 @@ AV_RATE_LIMIT_SLEEP = 13
 
 def _extract_rates(raw_rates: dict) -> dict[str, Decimal]:
     extracted: dict[str, Decimal] = {}
-    for code in CURRENCY_TO_FIELD:
+    for code, (_field, _pair, invert) in CURRENCY_TO_FIELD.items():
         if code not in raw_rates:
             continue
-        extracted[code] = Decimal(str(raw_rates[code]))
+        val = Decimal(str(raw_rates[code]))
+        extracted[code] = (Decimal("1") / val) if invert else val
     return extracted
 
 
@@ -84,12 +102,14 @@ def fetch_from_primary() -> Optional[dict[str, Decimal]]:
             return None
 
         rates = _extract_rates(conversion_rates)
-        if len(rates) != len(CURRENCY_TO_FIELD):
-            missing = set(CURRENCY_TO_FIELD) - set(rates)
-            logger.error(f"Primary API missing currencies: {missing}")
+        missing = set(CURRENCY_TO_FIELD) - set(rates)
+        if missing:
+            logger.warning(f"Primary API missing currencies: {missing}")
+        if "INR" not in rates:
+            logger.error("Primary API missing INR — core rate unavailable")
             return None
 
-        logger.info(f"Primary API success — USD/INR={rates['INR']}")
+        logger.info(f"Primary API success — USD/INR={rates['INR']}, EUR/USD={rates.get('EUR')}, GBP/USD={rates.get('GBP')}")
         return rates
     except requests.RequestException as exc:
         logger.error(f"Primary API request failed: {exc}")
@@ -105,7 +125,7 @@ def fetch_from_alpha_vantage_fallback() -> Optional[dict[str, Decimal]]:
         return None
 
     rates: dict[str, Decimal] = {}
-    for currency in CURRENCY_TO_FIELD:
+    for currency, (_field, _pair, invert) in CURRENCY_TO_FIELD.items():
         try:
             url = AV_FALLBACK_URL.format(currency=currency)
             response = requests.get(url, timeout=REQUEST_TIMEOUT)
@@ -114,7 +134,8 @@ def fetch_from_alpha_vantage_fallback() -> Optional[dict[str, Decimal]]:
                 rate_data = data.get("Realtime Currency Exchange Rate", {})
                 rate_str = rate_data.get("5. Exchange Rate")
                 if rate_str:
-                    rates[currency] = Decimal(str(rate_str))
+                    val = Decimal(str(rate_str))
+                    rates[currency] = (Decimal("1") / val) if invert else val
                     time.sleep(AV_RATE_LIMIT_SLEEP)
                 else:
                     logger.warning(
@@ -127,13 +148,14 @@ def fetch_from_alpha_vantage_fallback() -> Optional[dict[str, Decimal]]:
         except Exception as exc:
             logger.warning(f"Alpha Vantage fallback: {currency} failed — {exc}")
 
-    if len(rates) < 6:
+    n_total = len(CURRENCY_TO_FIELD)
+    if len(rates) < n_total - 3:
         logger.error(
-            f"Alpha Vantage fallback incomplete: got {len(rates)}/6 currencies"
+            f"Alpha Vantage fallback incomplete: got {len(rates)}/{n_total} currencies"
         )
-        return None if len(rates) < 4 else rates
+        return None if "INR" not in rates else rates
 
-    logger.info("Alpha Vantage fallback: all 6 currencies fetched")
+    logger.info(f"Alpha Vantage fallback: {len(rates)}/{n_total} currencies fetched")
     return rates
 
 
@@ -193,49 +215,85 @@ def write_rates_to_db(
             "VND": latest.usd_vnd,
             "CNY": latest.usd_cny,
             "TRY": latest.usd_try,
+            "MAD": latest.usd_mad,
             "PKR": latest.usd_pkr,
+            "IDR": latest.usd_idr,
+            "LKR": latest.usd_lkr,
+            "MXN": latest.usd_mxn,
+            "THB": latest.usd_thb,
+            "KHR": latest.usd_khr,
+            "EUR": latest.eur_usd,
+            "GBP": latest.gbp_usd,
         }
 
     validated: dict[str, Optional[Decimal]] = {}
-    for code, (_field_name, pair) in CURRENCY_TO_FIELD.items():
+    for code, (_field_name, pair, _invert) in CURRENCY_TO_FIELD.items():
+        raw = rates.get(code)
+        if raw is None:
+            validated[code] = None
+            continue
         validated[code] = validate_and_log(
-            rates[code],
+            raw,
             lambda v, p=pair, prev=previous_by_code.get(code): validate_fx_rate(
                 v, p, prev
             ),
             ctx,
         )
 
-    if any(v is None for v in validated.values()):
-        logger.error("FX validation failed for one or more currencies.")
+    if validated.get("INR") is None:
+        logger.error("INR validation failed — core rate missing, aborting write.")
         return None
 
     data_source_url = DATA_SOURCE_URL_TEMPLATE
     value_kwargs = {
         "usd_inr": validated["INR"],
-        "usd_bdt": validated["BDT"],
-        "usd_vnd": validated["VND"],
-        "usd_cny": validated["CNY"],
-        "usd_try": validated["TRY"],
-        "usd_pkr": validated["PKR"],
+        "usd_bdt": validated.get("BDT"),
+        "usd_vnd": validated.get("VND"),
+        "usd_cny": validated.get("CNY"),
+        "usd_try": validated.get("TRY"),
+        "usd_mad": validated.get("MAD"),
+        "usd_pkr": validated.get("PKR"),
+        "usd_idr": validated.get("IDR"),
+        "usd_lkr": validated.get("LKR"),
+        "usd_mxn": validated.get("MXN"),
+        "usd_thb": validated.get("THB"),
+        "usd_khr": validated.get("KHR"),
+        "eur_usd": validated.get("EUR"),
+        "gbp_usd": validated.get("GBP"),
         "source": SOURCE_SYSTEM,
         "data_source_url": data_source_url,
         "status": _quality_tag_for_source(source),
     }
-    if is_duplicate_row(db, FxRates, {}, value_kwargs):
+    # Duplicate check scoped to today — prevents same-day re-runs from inserting twice
+    if is_duplicate_row(db, FxRates, {"as_of_date": today}, value_kwargs):
         ctx.stale()
-        logger.info("FX rates unchanged from latest pull — skipping insert")
+        logger.info("FX rates unchanged from today's pull — skipping insert")
         return latest
 
     pulled_at = datetime.now(timezone.utc)
-    mark_latest(db, FxRates, {"as_of_date": today})
+    # Demote only PRIOR LIVE rows for today — never the historical weekly/FRED
+    # backbone. (Was mark_latest({"as_of_date": today}), which demoted every
+    # source for the date and could knock a weekly row out of the latest view.)
+    db.query(FxRates).filter(
+        FxRates.as_of_date == today,
+        FxRates.source.in_(LIVE_SOURCES),
+        FxRates.is_latest.is_(True),
+    ).update({"is_latest": False}, synchronize_session="fetch")
     record = FxRates(
         usd_inr=validated["INR"],
-        usd_bdt=validated["BDT"],
-        usd_vnd=validated["VND"],
-        usd_cny=validated["CNY"],
-        usd_try=validated["TRY"],
-        usd_pkr=validated["PKR"],
+        usd_bdt=validated.get("BDT"),
+        usd_vnd=validated.get("VND"),
+        usd_cny=validated.get("CNY"),
+        usd_try=validated.get("TRY"),
+        usd_mad=validated.get("MAD"),
+        usd_pkr=validated.get("PKR"),
+        usd_idr=validated.get("IDR"),
+        usd_lkr=validated.get("LKR"),
+        usd_mxn=validated.get("MXN"),
+        usd_thb=validated.get("THB"),
+        usd_khr=validated.get("KHR"),
+        eur_usd=validated.get("EUR"),
+        gbp_usd=validated.get("GBP"),
         source=SOURCE_SYSTEM,
         data_source_url=data_source_url,
         refresh="real_time_6h",
@@ -247,7 +305,10 @@ def write_rates_to_db(
     db.add(record)
     db.flush()
     ctx.increment_inserted()
-    logger.info(f"FX rates appended for data_as_of={today}")
+    logger.info(
+        f"FX rates written for {today} — "
+        f"USD/INR={record.usd_inr} EUR/USD={record.eur_usd} GBP/USD={record.gbp_usd}"
+    )
     return record
 
 
@@ -289,7 +350,9 @@ def run_once() -> bool:
                 f"FX rates written — ID: {record.fx_rate_id} | "
                 f"USD/INR: {record.usd_inr} | USD/BDT: {record.usd_bdt} | "
                 f"USD/VND: {record.usd_vnd} | USD/CNY: {record.usd_cny} | "
-                f"USD/TRY: {record.usd_try} | USD/PKR: {record.usd_pkr}"
+                f"USD/TRY: {record.usd_try} | USD/MAD: {record.usd_mad} | "
+                f"USD/PKR: {record.usd_pkr} | EUR/USD: {record.eur_usd} | "
+                f"GBP/USD: {record.gbp_usd}"
             )
             return True
     except Exception as exc:

@@ -11,8 +11,9 @@ from sqlalchemy.orm import Session
 
 from data.ingestion._env import load_project_env
 from data.ingestion.wasde_common import current_marketing_year
-from database.database import SessionLocal
+from database.base import SessionLocal
 from database.models import Cotton
+from database.models.weather import CottonSupplyDemand
 
 load_project_env()
 
@@ -411,9 +412,87 @@ def apply_wasde_to_rows_in_marketing_year(
     return updated
 
 
+def write_supply_demand_row(
+    db: Session, data: dict[str, Any], market_year: int, report_month: date
+) -> None:
+    """
+    Write (or update) one CottonSupplyDemand row for this marketing_year + report_month.
+    One row per (marketing_year, report_month) — the full WASDE balance sheet
+    as published in that specific WASDE release.
+
+    This is separate from the cotton table WASDE stamp: the cotton table gets
+    wasde_su_ratio_pct stamped on every price row for the marketing year, but
+    cotton_supply_demand holds the complete balance sheet with all country-level
+    production figures — the authoritative version for the model.
+    """
+    from datetime import datetime, timezone
+    from database.base import is_duplicate_row, mark_latest
+
+    world_su = data.get("world_su_ratio")
+    world_prod = data.get("world_production")
+
+    dup_filter = {"marketing_year": market_year, "report_month": report_month}
+    dup_values = {
+        "world_stocks_to_use_ratio_pct": world_su,
+        "world_production_million_bales": world_prod,
+    }
+
+    if is_duplicate_row(db, CottonSupplyDemand, dup_filter, dup_values):
+        logger.info("  CottonSupplyDemand MY%d/%s unchanged — skipping", market_year, report_month)
+        return
+
+    mark_latest(db, CottonSupplyDemand, dup_filter)
+
+    db.add(CottonSupplyDemand(
+        marketing_year=market_year,
+        report_month=report_month,
+        forecast_provider="USDA_WASDE",
+        world_production_million_bales=world_prod,
+        world_mill_use_million_bales=data.get("world_mill_use"),
+        world_exports_million_bales=data.get("world_exports"),
+        world_ending_stocks_million_bales=data.get("world_ending_stocks"),
+        world_stocks_to_use_ratio_pct=world_su,
+        us_production_million_bales=data.get("us_production"),
+        us_harvested_area_thousand_acres=data.get("us_harvested_area"),
+        india_production_million_bales=data.get("india_production"),
+        china_production_million_bales=data.get("china_production"),
+        pakistan_production_million_bales=data.get("pakistan_production"),
+        australia_production_million_bales=data.get("australia_production"),
+        brazil_production_million_bales=data.get("brazil_production"),
+        west_africa_production_million_bales=data.get("west_africa_production"),
+        us_pct_planted=None,            # stamped later by crop_progress_ingestion
+        us_crop_condition_good_excellent_pct=None,
+        usda_season_avg_price_cents_per_lb=(
+            (data["season_price"] * 100).quantize(Decimal("0.0001"))
+            if data.get("season_price") else None
+        ),
+        cotlook_a_index_cents_per_lb=None,   # stamped by separate Cotlook source
+        source="wasde_ingestion",
+        data_source_url=f"{USDA_FAS_BASE}/commodity/{COTTON_CODE}/country/all/year/{market_year}",
+        notes=f"type={data.get('report_type','unknown')}",
+        pulled_at=datetime.now(timezone.utc),
+        is_latest=True,
+    ))
+    db.commit()
+    logger.info(
+        "  CottonSupplyDemand MY%d/%s: world_prod=%.2f | S/U=%.1f%% | india=%.2f | china=%.2f",
+        market_year, report_month,
+        float(world_prod) if world_prod else 0,
+        float(world_su) if world_su else 0,
+        float(data.get("india_production") or 0),
+        float(data.get("china_production") or 0),
+    )
+
+
 def write_balance_sheet(db: Session, data: dict[str, Any], market_year: int) -> int:
     updated = apply_wasde_to_rows_in_marketing_year(db, data, market_year)
     start, end = marketing_year_bounds(market_year)
+
+    # Write the full balance sheet to cotton_supply_demand
+    # Report month = first day of the current calendar month (proxy for WASDE release month)
+    today = date.today()
+    report_month = date(today.year, today.month, 1)
+    write_supply_demand_row(db, data, market_year, report_month)
 
     if updated:
         logger.info(
@@ -430,7 +509,18 @@ def write_balance_sheet(db: Session, data: dict[str, Any], market_year: int) -> 
 
 
 def backfill_wasde_history(db: Session) -> int:
-    """Fetch MY2010–MY2025 WASDE data and stamp each cotton row in-range."""
+    """
+    Fetch MY2010–MY2025 WASDE data.
+
+    For each marketing year:
+      - Stamps wasde_forecast / wasde_ending_stocks / wasde_su_ratio_pct
+        onto all cotton price rows in that marketing year (existing behaviour)
+      - Writes a CottonSupplyDemand row with the full balance sheet.
+        report_month is set to August 1 of the marketing year start (the WASDE
+        August forecast is the first full estimate for each season and the most
+        comparable across years). This gives one canonical row per marketing year
+        for the full historical balance sheet.
+    """
     get_countries_lookup()
     total_rows = 0
     years_applied = 0
@@ -443,10 +533,22 @@ def backfill_wasde_history(db: Session) -> int:
                 logger.warning(f"MY {market_year}/{market_year + 1}: validation failed — skipped")
                 continue
 
-            updated = write_balance_sheet(db, balance, market_year)
+            # Stamp WASDE onto cotton rows
+            updated = apply_wasde_to_rows_in_marketing_year(db, balance, market_year)
             total_rows += updated
+
+            # Write balance sheet to cotton_supply_demand
+            # Use August 1 of the marketing year as the canonical report month
+            report_month = date(market_year, 8, 1)
+            write_supply_demand_row(db, balance, market_year, report_month)
+
             if updated:
                 years_applied += 1
+                start, end = marketing_year_bounds(market_year)
+                logger.info(
+                    f"MY {market_year}/{market_year + 1}: "
+                    f"{updated} cotton rows + 1 supply_demand row written"
+                )
         except RuntimeError as exc:
             logger.warning(f"MY {market_year}/{market_year + 1}: fetch failed — {exc}")
 

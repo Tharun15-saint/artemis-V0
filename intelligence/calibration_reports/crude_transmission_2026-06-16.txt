@@ -1,0 +1,17 @@
+ARTEMIS — Crude → Dyeing Chemical Transmission Calibration
+Run date: 2026-06-16
+==================================================================
+
+STEP 1-2 — DATA ASSEMBLY FUNNEL:
+  Total fabric_dyeing rows:           0
+  With production_date:               0
+  With chemical_cost:                 0
+  Quality-gated (pass / shade≥70):    0
+  Crude join succeeds (raw pairs):    0
+  Extraction yield:                   0.0%
+
+STATUS: PENDING — 0/20 validated pairs. 20 more required.
+  Minimum required: n>=20.  Need 20 more validated pair(s).
+
+Activation requires: n>=20, R²>=0.40, p<0.01, positive coefficient, 95% CI excludes 0.
+Next scheduled run: tomorrow.

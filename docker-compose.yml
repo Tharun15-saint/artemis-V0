@@ -1,0 +1,30 @@
+# Local PostgreSQL + TimescaleDB for Artemis development.
+#
+#   Start:   docker compose up -d
+#   Logs:    docker compose logs -f db
+#   Stop:    docker compose down            (keeps data)
+#   Reset:   docker compose down -v         (deletes data volume — destructive)
+#
+# Connection string (matches DATABASE_URL in .env):
+#   postgresql+psycopg://artemis:artemis@localhost:5432/artemis
+services:
+  db:
+    image: timescale/timescaledb-ha:pg16
+    container_name: artemis-timescale
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: artemis
+      POSTGRES_PASSWORD: artemis
+      POSTGRES_DB: artemis
+    ports:
+      - "5432:5432"
+    volumes:
+      - artemis_pgdata:/home/postgres/pgdata/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U artemis -d artemis"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  artemis_pgdata:

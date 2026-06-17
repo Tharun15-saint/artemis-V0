@@ -1,0 +1,48 @@
+ARTEMIS — April 2026 Brent Crude Deviation Audit
+Run date: 2026-06-16
+============================================================
+
+SOURCES:
+  FRED weekly EOP (crude_oil, source=fred_api):     $114.29 (4 obs)
+  World Bank Pink Sheet (crude_oil, source=WB):     $120.42
+  FRED daily DCOILBRENTEU (ground truth):           $117.29 (20 trading days)
+    Daily range: $98.63 – $138.21
+
+DEVIATIONS:
+  FRED weekly vs EIA daily:   -2.56%
+  Pink Sheet vs EIA daily:    +2.67% 
+  Pink Sheet vs FRED weekly:  -5.09% 
+
+FRED weekly daily observations:
+  2026-04-01: $119.56
+  2026-04-02: $127.61
+  2026-04-07: $138.21
+  2026-04-08: $122.11
+  2026-04-09: $119.03
+  2026-04-10: $119.07
+  2026-04-13: $123.28
+  2026-04-14: $118.69
+  2026-04-15: $114.93
+  2026-04-16: $116.63
+  2026-04-17: $98.63
+  2026-04-20: $103.40
+  2026-04-21: $106.14
+  2026-04-22: $113.44
+  2026-04-23: $113.25
+  2026-04-24: $111.86
+  2026-04-27: $113.89
+  2026-04-28: $117.62
+  2026-04-29: $124.16
+  2026-04-30: $124.24
+
+OUTLIER DETERMINATION: pink_sheet
+  5.1% deviation vs FRED weekly. EIA daily avg=$117.29 used as tiebreaker. Pink Sheet=$120.42 vs FRED daily avg=$117.29 (+2.67%).
+
+ACTION TAKEN: pink_sheet row 802 flagged DEVIATION_FLAGGED (no delete)
+
+INTERPRETATION:
+  April 2026 was an unusually volatile month ($99–$138 range).
+  FRED weekly EOP values sample specific end-of-period days which may fall on
+  lower-price days, understating the true monthly average.
+  Pink Sheet represents a full-month average which is closer to the daily ground truth.
+  Primary reconciliation check (check_4 EIA daily) supersedes FRED vs Pink Sheet comparison.

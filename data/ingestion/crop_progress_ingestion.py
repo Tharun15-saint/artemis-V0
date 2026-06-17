@@ -10,8 +10,8 @@ import requests
 
 from data.ingestion._env import load_project_env
 from data.ingestion.wasde_common import current_marketing_year
-from database.database import SessionLocal
-from database.models import CottonSupplyDemand
+from database.base import SessionLocal
+from database.models.weather import CottonSupplyDemand
 
 load_project_env()
 
@@ -120,10 +120,21 @@ def _update_crop_progress_row(
         .first()
     )
     if not row:
-        logger.warning(
-            f"No CottonSupplyDemand row for MY {marketing_year} — run WASDE backfill first"
+        # Create a stub row so crop progress data is not lost even if WASDE hasn't run
+        from datetime import datetime, timezone
+        row = CottonSupplyDemand(
+            marketing_year=marketing_year,
+            report_month=report_month,
+            forecast_provider="USDA_NASS",
+            source="crop_progress_ingestion",
+            pulled_at=datetime.now(timezone.utc),
+            is_latest=True,
         )
-        return False
+        db.add(row)
+        logger.info(
+            f"Created stub CottonSupplyDemand row for MY {marketing_year} "
+            f"(WASDE fields will be populated when wasde_ingestion.py runs)"
+        )
 
     if pct_planted is not None:
         row.us_pct_planted = pct_planted

@@ -54,12 +54,10 @@ APPEND_ONLY_ENTITY_KEYS: dict[str, list[str]] = {
     "yarn": ["yarn_id"],
 }
 
-CRUDE_OIL_FRESHNESS_DAYS = 14
-
 FRESHNESS_CHECKS = [
     ("cotton", Cotton, "as_of_date", STALENESS["cotton"], "warn"),
     ("fx_rates", FxRates, "pulled_at", STALENESS["fx_rates"], "warn"),
-    ("crude_oil", CrudeOil, "as_of_date", CRUDE_OIL_FRESHNESS_DAYS, "warn"),
+    ("crude_oil", CrudeOil, "as_of_date", STALENESS["crude_oil_warn"], "warn"),
 ]
 
 
@@ -232,28 +230,75 @@ def check_cross_table_consistency(db: Session, report: HealthReport) -> None:
 
     if fx is None or fx.usd_inr is None:
         report.warn("Cannot check yarn USD implied — no USD/INR FX rate")
-        return
-    if yarn is None or yarn.price_per_kg is None:
+    elif yarn is None or yarn.price_per_kg is None:
         report.warn("Cannot check yarn USD implied — no yarn price data")
-        return
+    else:
+        usd_inr = Decimal(str(fx.usd_inr))
+        price_inr = Decimal(str(yarn.price_per_kg))
+        if usd_inr <= 0:
+            report.warn("USD/INR rate is zero or negative")
+        else:
+            implied_usd = price_inr / usd_inr
+            lo, hi = Decimal("1.50"), Decimal("4.50")
+            if lo <= implied_usd <= hi:
+                report.ok(
+                    f"Yarn price USD implied: ${implied_usd:.2f}/kg "
+                    f"(within ${lo}-${hi} range)"
+                )
+            else:
+                report.warn(
+                    f"Yarn price USD implied: ${implied_usd:.2f}/kg "
+                    f"outside ${lo}-${hi} range — possible data quality issue"
+                )
 
-    usd_inr = Decimal(str(fx.usd_inr))
-    price_inr = Decimal(str(yarn.price_per_kg))
-    if usd_inr <= 0:
-        report.warn("USD/INR rate is zero or negative")
-        return
-
-    implied_usd = price_inr / usd_inr
-    lo, hi = Decimal("1.50"), Decimal("4.50")
-    if lo <= implied_usd <= hi:
+    # Crude oil derived fields: post-2004 rows must have INR materialized
+    # (FX history starts 2004-01-01; pre-2004 crude rows correctly have NULL INR)
+    from datetime import date as _date
+    cutoff = _date(2004, 1, 1)
+    crude_total_post2004 = (
+        db.query(func.count(CrudeOil.crude_oil_id))
+        .filter(CrudeOil.is_latest.is_(True), CrudeOil.as_of_date >= cutoff)
+        .scalar()
+        or 0
+    )
+    crude_null_inr = (
+        db.query(func.count(CrudeOil.crude_oil_id))
+        .filter(
+            CrudeOil.is_latest.is_(True),
+            CrudeOil.as_of_date >= cutoff,
+            CrudeOil.brent_inr_per_barrel.is_(None),
+        )
+        .scalar()
+        or 0
+    )
+    if crude_null_inr == 0:
         report.ok(
-            f"Yarn price USD implied: ${implied_usd:.2f}/kg "
-            f"(within ${lo}-${hi} range)"
+            f"crude_oil INR materialized: all {crude_total_post2004} "
+            f"post-2004 rows have brent_inr_per_barrel"
         )
     else:
         report.warn(
-            f"Yarn price USD implied: ${implied_usd:.2f}/kg "
-            f"outside ${lo}-${hi} range — possible data quality issue"
+            f"crude_oil: {crude_null_inr}/{crude_total_post2004} post-2004 rows "
+            f"missing brent_inr_per_barrel — run crude_oil_cleanup.py"
+        )
+
+    # trend_30d_pct: recent rows (last 60 days) must be populated
+    sixty_days_ago = _date.today() - timedelta(days=60)
+    crude_recent_null_trend = (
+        db.query(func.count(CrudeOil.crude_oil_id))
+        .filter(
+            CrudeOil.is_latest.is_(True),
+            CrudeOil.as_of_date >= sixty_days_ago,
+            CrudeOil.trend_30d_pct.is_(None),
+        )
+        .scalar()
+        or 0
+    )
+    if crude_recent_null_trend == 0:
+        report.ok("crude_oil trend_30d_pct: populated on all recent rows")
+    else:
+        report.warn(
+            f"crude_oil: {crude_recent_null_trend} recent row(s) with NULL trend_30d_pct"
         )
 
 

@@ -37,22 +37,40 @@ def validate_crude_price(
     price_usd_per_barrel,
     previous_spot=None,
 ) -> tuple[bool, str]:
+    """Hard structural bounds only — does NOT reject on week-over-week change.
+
+    Crude oil routinely moves >20% in a single week during market stress events
+    (COVID crash: -55% over 3 weeks; 1990 Gulf War: +54% in a month; 2022 Ukraine:
+    +30% in 2 weeks). Rejecting on change guard silently loses real price data.
+    Use check_crude_price_change_flag() to flag anomalies without rejecting.
+    """
     if price_usd_per_barrel is None:
         return False, "crude_price: None value"
     if price_usd_per_barrel <= 0:
         return False, f"crude_price: {price_usd_per_barrel} zero or negative"
     if price_usd_per_barrel < 10:
-        return False, f"crude_price: {price_usd_per_barrel} below minimum $10"
+        return False, f"crude_price: {price_usd_per_barrel} below minimum $10/bbl"
     if price_usd_per_barrel > 250:
-        return False, f"crude_price: {price_usd_per_barrel} above maximum $250"
-    if previous_spot is not None and previous_spot > 0:
-        pct_change = abs(price_usd_per_barrel - previous_spot) / previous_spot * 100
-        if pct_change > 20:
-            return False, (
-                f"crude_price: {price_usd_per_barrel:.2f} is {pct_change:.1f}% "
-                f"different from previous {previous_spot:.2f} — exceeds 20% threshold"
-            )
+        return False, f"crude_price: {price_usd_per_barrel} above maximum $250/bbl"
     return True, ""
+
+
+def check_crude_price_change_flag(
+    price_usd_per_barrel,
+    previous_spot,
+    label: str = "crude",
+) -> Optional[str]:
+    """Returns a warning string if week-over-week change exceeds 20%, else None.
+    Caller should ctx.record_flag() and logger.warning() but MUST still write the row."""
+    if previous_spot is None or previous_spot <= 0:
+        return None
+    pct_change = abs(price_usd_per_barrel - previous_spot) / previous_spot * 100
+    if pct_change > 20:
+        return (
+            f"{label}: {float(price_usd_per_barrel):.2f} is {pct_change:.1f}% "
+            f"from prior {float(previous_spot):.2f} — large move, row written"
+        )
+    return None
 
 
 def validate_fx_rate(
@@ -68,6 +86,13 @@ def validate_fx_rate(
         "USD_TRY": (1, 50),
         "USD_MAD": (7, 12),
         "USD_PKR": (55, 340),
+        "EUR_USD": (0.82, 1.65),   # USD per 1 EUR — range since 1999 launch
+        "GBP_USD": (1.05, 2.15),   # USD per 1 GBP — range since early 2000s
+        "USD_IDR": (2000, 21000),   # Indonesian Rupiah — 2004 low ~8900, 2026 high ~17,800+
+        "USD_LKR": (30, 420),       # Sri Lanka Rupee — pre-crisis low ~60, 2022 peak ~370
+        "USD_MXN": (3, 25),         # Mexican Peso — post-float low ~3.4, 2020 peak ~25
+        "USD_THB": (20, 60),        # Thai Baht — 1997 crisis high ~56, stable ~30-35
+        "USD_KHR": (3500, 4300),    # Cambodian Riel — NBC soft peg at ~4000/USD since 1994
     }
     if rate is None:
         return False, f"fx_rate {currency_pair}: None value"

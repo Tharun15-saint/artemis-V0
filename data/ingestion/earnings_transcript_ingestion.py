@@ -44,32 +44,48 @@ logging.basicConfig(
 )
 
 SOURCE_NAME = "earnings_transcript_ingestion"
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
 DOCUMENT_TYPE = "earnings_call_transcript"
 EXTRACTION_MODEL = "claude-sonnet-4-6"
-EXTRACTION_PROMPT_VER = "v2.0"
-CLAUDE_RATE_LIMIT_SECONDS = 0.5
+EXTRACTION_PROMPT_VER = "v4.0"
+CLAUDE_RATE_LIMIT_SECONDS = 0.3
 MIN_PASSAGE_SENTENCES = 2
-MAX_PASSAGE_SENTENCES = 4
+MAX_PASSAGE_SENTENCES = 12  # Full speaker turns preserved; 4 was too aggressive and destroyed context
+_CLAUDE_MAX_RETRIES = 3
+_CLAUDE_RETRY_BACKOFF = 2.0
 
 ALLOWED_RETAILER_IDS = {1, 2}  # Target Corporation, Walmart Inc
 
+# The 23 canonical categories enforced by signal_category_taxonomy (the FK target).
+# Keep in sync with data/seeds/signal_category_taxonomy_seed.py.
 SIGNAL_CATEGORIES = frozenset({
     "apparel_sales_performance",
     "inventory_positioning",
     "forward_guidance",
-    "tariff_and_sourcing_geography",
-    "margin_pressure",
     "consumer_demand",
+    "margin_pressure",
     "channel_mix",
+    "category_mix_shift",
     "vendor_supply_chain",
+    "tariff_and_sourcing_geography",
     "analyst_pressure",
-    "retailer_strategy",
+    "consumer_behavior_language",
+    "seasonal_sellthrough",
+    "private_brand_penetration",
+    "membership_signals",
+    "off_price_buying_signal",
+    "ecommerce_penetration",
     "store_expansion",
+    "pricing_and_markdown",
+    "freight_and_logistics",
+    "retailer_strategy",
     "fulfillment_requirements",
     "pricing_pressure",
     "program_risk",
 })
+
+BUSINESS_SEGMENTS = frozenset({"walmart_us", "sams_club", "target_us", "enterprise", "international"})
+TIME_HORIZONS = frozenset({"immediate", "near_term", "medium_term", "long_term", "unspecified"})
 
 SIGNAL_SENTIMENTS = frozenset({"positive", "negative", "neutral", "mixed"})
 SIGNAL_STRENGTHS = frozenset({"strong", "moderate", "weak"})
@@ -181,14 +197,28 @@ SYSTEM_PROMPT = (
     "prices the retailer will accept and how much cost pressure they will "
     "transmit to apparel suppliers. "
     "\n\n"
-    "DO NOT EXTRACT if the passage is primarily about: "
-    "Food, grocery, beverage, or pharmacy category performance with no "
-    "connection to apparel or discretionary spending impact. "
-    "Beauty, cosmetics, skincare, or personal care — unless explicitly stated "
-    "to be displacing apparel floor space or reducing apparel open-to-buy. "
-    "Home furnishings, furniture, or home decor — unless explicitly displacing "
-    "apparel investment or floor space. "
-    "Electronics, hardlines, or toys with no apparel connection. "
+    "HARD NOISE FILTER — return null if the passage's PRIMARY SUBJECT is the "
+    "sales, comp, share, or inventory performance of a non-apparel category, "
+    "even when it is quantified. The test is what the sentence is ABOUT, not "
+    "what words it contains. Reject when the subject is: food, grocery, "
+    "beverage, consumables, fresh/produce, snacks; pharmacy, clinic, optical, "
+    "or health services; beauty, cosmetics, skincare, personal care; home, "
+    "home furnishings, furniture, decor, hardlines, kitchen, appliances; "
+    "electronics, toys, sporting goods, automotive, pet. A line like "
+    "'Food & Beverage net sales grew to $6.6B' or 'Sam's Club consumables comp "
+    "rose on private brands in juice and laundry' or 'online grocery drove "
+    "100bps of ecommerce comp' is NOISE — return null — because the demand it "
+    "describes is not apparel demand and will not flow to a garment program. "
+    "RESCUE ONLY IF apparel/fashion/softlines/denim/footwear is the actual "
+    "subject, OR the non-apparel category is named purely as context for an "
+    "apparel, discretionary, total-company-comp, gross-margin, sourcing, "
+    "tariff, or consumer-financial-health signal (e.g. 'a consumer pressured by "
+    "food inflation is trading down out of discretionary apparel' is a KEEP; "
+    "'Style, Baby and Wellness led comps' is a KEEP because Style is apparel). "
+    "When in doubt about whether apparel demand is genuinely implicated, return "
+    "null — a smaller, precise corpus is worth far more than a larger, noisy one. "
+    "Store construction, parking, or real estate details unrelated to apparel "
+    "floor space or fashion assortment. "
     "Store construction, parking, or real estate details unrelated to apparel "
     "floor space or fashion assortment. "
     "Executive compensation, board governance, or shareholder return language. "
@@ -229,35 +259,105 @@ SYSTEM_PROMPT = (
     "quarter confirms recovery or further decline.' "
     "\n\n"
     "Return JSON with exactly these fields: "
-    "signal_category (one of: apparel_sales_performance, inventory_positioning, "
-    "forward_guidance, tariff_and_sourcing_geography, margin_pressure, "
-    "consumer_demand, channel_mix, vendor_supply_chain, analyst_pressure, "
-    "retailer_strategy, store_expansion, fulfillment_requirements, "
-    "pricing_pressure, program_risk), "
+    "signal_category — the single best fit from this canonical 23-category "
+    "taxonomy (use these exact strings, no others): "
+    "apparel_sales_performance (direct apparel/fashion/softlines comp, sales, "
+    "or category-share performance); "
+    "inventory_positioning (retailer inventory levels, days on hand, receipt "
+    "timing, cleanliness, lean vs excess positioning); "
+    "forward_guidance (management guidance on future sales, margins, volumes, "
+    "or buying plans); "
+    "consumer_demand (broad consumer spending, traffic, basket, and demand "
+    "environment governing discretionary/apparel buying); "
+    "margin_pressure (gross/operating margin trend and the cost pressure it "
+    "transmits to apparel suppliers); "
+    "channel_mix (digital vs physical, owned vs marketplace channel split/ratio); "
+    "category_mix_shift (shifts between product categories, including apparel "
+    "vs grocery/general-merchandise mix); "
+    "vendor_supply_chain (supplier relationships, vendor base changes, sourcing, "
+    "PO/cancellation behavior); "
+    "tariff_and_sourcing_geography (tariffs, Section 301, de minimis, "
+    "country-of-origin, nearshoring affecting apparel imports); "
+    "analyst_pressure (an analyst explicitly challenging management on a risk, "
+    "performance gap, or strategic inconsistency); "
+    "consumer_behavior_language (value-seeking, trade-down, EDLP resonance, "
+    "private-brand preference language); "
+    "seasonal_sellthrough (sell-through of seasonal/temperature-sensitive "
+    "apparel and the read-through to reorders); "
+    "private_brand_penetration (own/private brand vs national brand mix and "
+    "strategy); "
+    "membership_signals (membership fee revenue, renewal, member growth — "
+    "warehouse-club/marketplace loyalty); "
+    "off_price_buying_signal (off-price purchasing activity indicating market "
+    "oversupply or excess inventory clearing); "
+    "ecommerce_penetration (online channel growth rate and penetration); "
+    "store_expansion (store openings, closures, remodels changing apparel "
+    "floor space and assortment capacity); "
+    "pricing_and_markdown (promotional intensity, markdown rates, clearance, "
+    "pricing strategy); "
+    "freight_and_logistics (freight cost and supply-chain logistics commentary); "
+    "retailer_strategy (AI, technology, and strategic initiatives shaping how "
+    "the retailer buys and sells fashion); "
+    "fulfillment_requirements (speed, in-stock, fill-rate, omnichannel "
+    "fulfilment standards placed on suppliers); "
+    "pricing_pressure (FOB price pressure, cost-reduction demands, and "
+    "price-gap management transmitted to apparel suppliers); "
+    "program_risk (signals indicating risk to existing or future apparel "
+    "programs). "
+    "business_segment (one of: walmart_us, sams_club, target_us, enterprise, "
+    "international — the reporting segment this signal applies to; use "
+    "enterprise for consolidated/company-wide statements, target_us for all "
+    "Target passages), "
+    "time_horizon (one of: immediate, near_term, medium_term, long_term, "
+    "unspecified — how far out the signal's consequence lands; immediate is "
+    "0-30 days, near_term 1-3 months, medium_term 3-12 months, long_term 12+ "
+    "months, unspecified when no horizon is implied), "
     "signal_sentiment (positive/negative/neutral/mixed), "
     "signal_strength (strong/moderate/weak), "
-    "confidence_score (0.0-1.0 — use below 0.5 only when the signal is "
-    "genuinely ambiguous or indirect), "
+    "confidence_score (0.0-1.0 — calibrate honestly: 0.9+ only when the "
+    "signal is explicit, unambiguous, and quantified; 0.7-0.9 for clear but "
+    "unquantified signals; 0.5-0.7 for implied or hedged signals; below 0.5 "
+    "only when genuinely speculative), "
     "is_forward_looking (true/false), "
-    "is_analyst_pressure (true/false — true only if an analyst is explicitly "
-    "challenging management on a specific risk or performance gap), "
+    "is_analyst_pressure (true/false — true ONLY if an analyst is explicitly "
+    "challenging management on a specific risk, performance gap, or strategic "
+    "inconsistency — NOT for routine follow-up questions or clarifications), "
     "affected_decision (one of: commodity_hedge_timing, yarn_procurement, "
     "factory_allocation, capacity_planning, freight_booking, fx_hedge, "
     "program_acceptance, pricing_negotiation, inventory_risk, "
     "vendor_qualification, compliance_posture, store_program_sizing), "
-    "artemis_implication (one to two sentences — a chain of consequences "
+    "number_mentioned (string or null — if the passage contains a specific "
+    "quantified metric, extract the most important one verbatim, e.g. "
+    "'3.9%', '$14.2B', '1,956 stores', 'down 180 bps' — null if no number), "
+    "time_period_referenced (string or null — the time period this signal "
+    "applies to, e.g. 'Q1 FY2026', 'second half of fiscal 2027', "
+    "'next quarter', 'full year guidance' — null if no time reference), "
+    "artemis_implication (two to three sentences — a chain of consequences "
     "tracing from this retail signal downstream through program risk, factory "
     "capacity, material procurement, and commodity exposure as far as the "
-    "signal warrants — specific, operational, actionable), "
+    "signal warrants — specific, operational, actionable. Name the specific "
+    "downstream layer affected and the specific action. Never write generic "
+    "statements. If the signal has no downstream consequence worth tracing, "
+    "this is not a relevant signal — return null for signal_category instead), "
     "extracted_signal (one sentence: what this passage actually says in plain "
-    "language, no interpretation). "
+    "language, no interpretation, including the specific number if present). "
     "Return ONLY valid JSON with no markdown fences or preamble. "
     "If the passage fails the relevance test, return "
     '{"signal_category": null}.'
 )
 
+# fool.com Q&A boundary. The strong, unambiguous marker is the operator opening
+# questions ("our first question comes from ...") — fool.com transcripts rarely
+# carry a "Questions and Answers" header. Ordered strong-first; the header forms
+# require "Session"/a colon so they don't fire on an intro mention like
+# "a question-and-answer session will follow".
 _QA_SPLIT_RE = re.compile(
-    r"(?:Question[\-\s]and[\-\s]Answer(?:\s+Session)?|Q\s*&\s*A\s+Session)",
+    r"(?:(?:first|next)\s+questions?\s+(?:comes?\s+from|is\s+from)"
+    r"|we\s+will\s+now\s+(?:begin|open|take)\s+(?:the\s+)?questions?"
+    r"|open\s+(?:the\s+)?(?:floor|line)\s+for\s+questions?"
+    r"|Question[\-\s]and[\-\s]Answer\s+Session"
+    r"|Q\s*&\s*A\s+Session"
+    r"|Questions?\s+and\s+Answers?\s*[:\n])",
     re.I,
 )
 _SENTENCE_RE = re.compile(r"[^.!?]+[.!?]+")
@@ -348,36 +448,92 @@ def _call_claude(
     if not os.getenv("ANTHROPIC_API_KEY"):
         logger.error("ANTHROPIC_API_KEY is not set")
         return None
-    try:
-        response = client.messages.create(
-            model=EXTRACTION_MODEL,
-            max_tokens=max_tokens,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-        time.sleep(CLAUDE_RATE_LIMIT_SECONDS)
-        if not response.content:
-            return None
-        return response.content[0].text
-    except Exception as exc:
-        logger.error("Claude API call failed: %s", exc)
-        return None
+    delay = CLAUDE_RATE_LIMIT_SECONDS
+    for attempt in range(1, _CLAUDE_MAX_RETRIES + 1):
+        try:
+            response = client.messages.create(
+                model=EXTRACTION_MODEL,
+                max_tokens=max_tokens,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            time.sleep(CLAUDE_RATE_LIMIT_SECONDS)
+            if not response.content:
+                return None
+            return response.content[0].text
+        except Exception as exc:
+            if attempt < _CLAUDE_MAX_RETRIES:
+                logger.warning(
+                    "Claude API call failed (attempt %d/%d): %s — retrying in %.1fs",
+                    attempt,
+                    _CLAUDE_MAX_RETRIES,
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
+                delay *= _CLAUDE_RETRY_BACKOFF
+            else:
+                logger.error(
+                    "Claude API call failed after %d attempts: %s",
+                    _CLAUDE_MAX_RETRIES,
+                    exc,
+                )
+    return None
 
 
-def _classify_role(name: str, title: Optional[str], section: str) -> str:
-    if _OPERATOR_RE.match(name.strip()):
+_EXEC_TITLE_TOKENS = ("chief", "president", "officer", "director", "executive", "head of", "treasurer")
+
+# fool.com CALL PARTICIPANTS lines: "Title — Name" (em-dash). Name is after the last dash.
+_FOOL_PARTICIPANT_SPLIT_RE = re.compile(r"\s[—–-]{1,2}\s")
+# Operator question-intro fragments that must NOT be treated as a new speaker turn.
+_FOOL_QUESTION_INTRO_RE = re.compile(
+    r"(?:our |the )?(?:next|first|following)\s+question|question\s+(?:is\s+)?(?:comes?\s+)?from\s+the\s+line\s+of",
+    re.I,
+)
+
+
+def _extract_fool_executives(text: str) -> set[str]:
+    """Authoritative executive roster from the fool.com CALL PARTICIPANTS block."""
+    execs: set[str] = set()
+    in_block = False
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.upper().startswith("CALL PARTICIPANTS"):
+            in_block = True
+            continue
+        if in_block:
+            if re.match(r"^(TAKEAWAYS|PREPARED REMARKS|Image source|DATE)\b", s, re.I):
+                break
+            parts = _FOOL_PARTICIPANT_SPLIT_RE.split(s)
+            if len(parts) >= 2:
+                name = parts[-1].strip()
+                if 2 <= len(name.split()) <= 4 and not any(c.isdigit() for c in name):
+                    execs.add(name)
+            else:
+                break  # non-participant line ends the block
+    return execs
+
+
+def _classify_role(
+    name: str, title: Optional[str], section: str, executives: Optional[set[str]] = None
+) -> str:
+    nm = name.strip()
+    if _OPERATOR_RE.match(nm):
         return "operator"
     combined = f"{name} {title or ''}".lower()
     if "chief executive" in combined or re.search(r"\bceo\b", combined):
         return "CEO"
     if "chief financial" in combined or re.search(r"\bcfo\b", combined):
         return "CFO"
-    if "analyst" in combined or (section == "qa" and title and "analyst" in title.lower()):
-        return "analyst"
-    if section == "qa" and title and not any(
-        token in title.lower()
-        for token in ("chief", "president", "officer", "director", "executive")
-    ):
+    if section == "qa":
+        # In Q&A: a speaker on the executive roster (or carrying an exec title) is
+        # management answering; everyone else asking/answering is an analyst.
+        if executives and nm in executives:
+            return "management"
+        if title and any(tok in title.lower() for tok in _EXEC_TITLE_TOKENS):
+            return "management"
         return "analyst"
     return "management"
 
@@ -432,7 +588,9 @@ def _split_transcript(text: str) -> tuple[str, str]:
     return text[: match.start()].strip(), text[match.end() :].strip()
 
 
-def _parse_section(section_name: str, text: str) -> list[TranscriptPassage]:
+def _parse_section(
+    section_name: str, text: str, executives: Optional[set[str]] = None
+) -> list[TranscriptPassage]:
     if not text.strip():
         return []
 
@@ -464,11 +622,18 @@ def _parse_section(section_name: str, text: str) -> list[TranscriptPassage]:
             )
 
     for line in lines:
+        s = line.strip()
+        # In Q&A, the operator's "next question is from ..." intro must not be read
+        # as a new speaker turn — attribute it to the operator (skipped).
+        if section_name == "qa" and len(s) < 160 and _FOOL_QUESTION_INTRO_RE.search(s):
+            flush_buffer()
+            current_name, current_title, current_role = "Operator", "Operator", "operator"
+            continue
         header = _parse_speaker_header(line)
-        if header and len(line.strip()) < 120:
+        if header and len(s) < 120:
             flush_buffer()
             current_name, current_title = header
-            current_role = _classify_role(current_name, current_title, section_name)
+            current_role = _classify_role(current_name, current_title, section_name, executives)
             continue
         buffer.append(line)
 
@@ -476,10 +641,139 @@ def _parse_section(section_name: str, text: str) -> list[TranscriptPassage]:
     return passages
 
 
-def parse_transcript(text: str) -> list[TranscriptPassage]:
+# --- Insider Monkey inline-speaker parsing -------------------------------------
+# Insider Monkey uses TWO speaker shapes that changed over time:
+#   inline (late-2025+):  "Brian Cornell: Thanks, John, ..."
+#   bare   (mid-2025):    "Operator:"  then the text on the following line(s)
+_IM_INLINE_SPEAKER_RE = re.compile(
+    r"^([A-Z][a-zA-Z.'\-]+(?:\s+[A-Z][a-zA-Z.'\-]+){0,3}):\s+(.+)$"
+)
+_IM_BARE_SPEAKER_RE = re.compile(
+    r"^([A-Z][a-zA-Z.'\-]+(?:\s+[A-Z][a-zA-Z.'\-]+){0,3}):\s*$"
+)
+# The Operator turn that opens the Q&A ("Our first question comes from ...").
+_IM_QA_START_RE = re.compile(r"\b(first question|question comes from|questions? from)\b", re.I)
+# Operator introduction of an analyst questioner: "... question ... from [the line of]
+# Paul Lejuez with Citigroup" / "... Corey Tarlowe Jefferies". Captures First Last
+# (exactly two words); any trailing capitalised words are the firm. We match analysts
+# by LAST name because the operator often uses a short first name (Joe/Mike/Kate) while
+# the speaker line carries the full one (Joseph/Michael/Katharine).
+_IM_ANALYST_INTRO_RE = re.compile(
+    r"question[^.]*?\bfrom\s+(?:the\s+line\s+of\s+)?"
+    r"([A-Z][a-zA-Z.'\-]+\s+[A-Z][a-zA-Z.'\-]+)"
+)
+
+
+def _im_valid_speaker(name: str) -> bool:
+    """A real speaker is 'Operator' or a 1-4 word capitalised personal name, no digits."""
+    if not name:
+        return False
+    if name.strip().lower() == "operator":
+        return True
+    words = name.split()
+    if not (2 <= len(words) <= 4):
+        return False
+    if any(ch.isdigit() for ch in name):
+        return False
+    return all(w[:1].isupper() for w in words)
+
+
+def _parse_insider_monkey(text: str) -> list[TranscriptPassage]:
+    """Parse an Insider Monkey transcript (inline speakers) into passages.
+
+    Prepared vs Q&A is determined by where the Operator opens questions, not by a
+    header marker. A Q&A speaker who is not a recognised executive (i.e. did not
+    speak in prepared remarks) and is not the Operator is classified as an analyst.
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    # 1) Group consecutive lines into (speaker, body) turns keyed on inline headers.
+    turns: list[tuple[str, str]] = []
+    cur_speaker: Optional[str] = None
+    cur_buf: list[str] = []
+    for line in lines:
+        mi = _IM_INLINE_SPEAKER_RE.match(line)
+        mb = _IM_BARE_SPEAKER_RE.match(line)
+        if mi and _im_valid_speaker(mi.group(1)):
+            if cur_speaker is not None:
+                turns.append((cur_speaker, " ".join(cur_buf).strip()))
+            cur_speaker = mi.group(1).strip()
+            cur_buf = [mi.group(2).strip()]
+        elif mb and _im_valid_speaker(mb.group(1)):
+            if cur_speaker is not None:
+                turns.append((cur_speaker, " ".join(cur_buf).strip()))
+            cur_speaker = mb.group(1).strip()
+            cur_buf = []
+        elif cur_speaker is not None:
+            cur_buf.append(line)
+        # lines before the first speaker (title, EPS blurb) are dropped
+    if cur_speaker is not None:
+        turns.append((cur_speaker, " ".join(cur_buf).strip()))
+
+    # 2) Find the Q&A boundary: first Operator turn that opens questions.
+    qa_start = None
+    for i, (spk, body) in enumerate(turns):
+        if spk == "Operator" and _IM_QA_START_RE.search(body):
+            qa_start = i
+            break
+
+    prepared = turns[:qa_start] if qa_start is not None else turns
+    qa = turns[qa_start:] if qa_start is not None else []
+
+    # 3) Analysts = exactly the people the operator introduces as questioners.
+    #    Executives who only appear in Q&A (answering, never introduced) must NOT be
+    #    misread as analysts — so the operator's introductions are the authoritative
+    #    signal. Fall back to the prepared-remarks roster only if no intros are found.
+    analyst_last_names: set[str] = set()
+    for spk, body in qa:
+        if spk == "Operator":
+            for m in _IM_ANALYST_INTRO_RE.finditer(body):
+                analyst_last_names.add(m.group(1).split()[-1].lower())
+    exec_speakers = {spk for spk, _ in prepared if spk != "Operator"}
+
+    def _last(name: str) -> str:
+        parts = name.split()
+        return parts[-1].lower() if parts else ""
+
+    passages: list[TranscriptPassage] = []
+
+    def emit(speaker: str, body: str, section: str) -> None:
+        if speaker == "Operator" or not body:
+            return  # operator turns are not extracted, same as fool.com
+        if section == "qa":
+            if analyst_last_names:
+                # Analysts are exactly those the operator introduced (matched by last
+                # name); everyone else answering in Q&A is an executive.
+                role = "analyst" if _last(speaker) in analyst_last_names else "management"
+            else:
+                role = "management" if speaker in exec_speakers else "analyst"
+        else:
+            role = "management"
+        for chunk in _chunk_passages(body):
+            passages.append(
+                TranscriptPassage(
+                    section=section,
+                    speaker_name=speaker,
+                    speaker_role=role,
+                    text=chunk,
+                    is_analyst_pressure=(role == "analyst"),
+                )
+            )
+
+    for spk, body in prepared:
+        emit(spk, body, "prepared_remarks")
+    for spk, body in qa:
+        emit(spk, body, "qa")
+    return passages
+
+
+def parse_transcript(text: str, source_format: str = "motley_fool") -> list[TranscriptPassage]:
+    if source_format == "insider_monkey":
+        return _parse_insider_monkey(text)
+    executives = _extract_fool_executives(text)
     remarks, qa = _split_transcript(text)
-    prep_passages = _parse_section("prepared_remarks", remarks)
-    qa_passages = _parse_section("qa", qa)
+    prep_passages = _parse_section("prepared_remarks", remarks, executives)
+    qa_passages = _parse_section("qa", qa, executives)
     passages = prep_passages
     passages.extend(qa_passages)
     return passages
@@ -539,9 +833,16 @@ def _resolve_is_analyst_pressure(
     """
     if passage.is_analyst_pressure:
         return True
-    if signal.get("signal_category") == "analyst_pressure":
+    if signal.get("signal_category") == "analyst_pressure_apparel":
         return True
     return bool(_to_bool(signal.get("is_analyst_pressure")))
+
+
+def _normalize_string_field(value: Any, max_len: int) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:max_len] if text else None
 
 
 def extract_signal_from_passage(
@@ -573,6 +874,12 @@ def extract_signal_from_passage(
     payload["signal_strength"] = _normalize_strength(payload.get("signal_strength"))
     payload["affected_decision"] = _normalize_affected_decision(
         payload.get("affected_decision")
+    )
+    payload["number_mentioned"] = _normalize_string_field(
+        payload.get("number_mentioned"), 50
+    )
+    payload["time_period_referenced"] = _normalize_string_field(
+        payload.get("time_period_referenced"), 30
     )
     return payload
 
@@ -607,12 +914,19 @@ def _demote_prior_transcript_rows(
     fiscal_year: int,
     fiscal_quarter: int,
 ) -> None:
-    """Demote prior transcript rows for this quarter before inserting new ones."""
+    """Supersede ALL prior active signals for this quarter before inserting new ones.
+
+    A successful v4.0 transcript extraction is the new source of truth for the
+    quarter, so it must demote every prior is_latest=1 row — including
+    press-release-sourced (v1.0) rows, not just prior transcript rows. (The
+    document_type filter previously left press-release rows active, duplicating
+    the quarter.) The caller only invokes this when there are new rows to write,
+    so a failed/empty extraction never empties a quarter.
+    """
     extract_filter = {
         "retailer_id": retailer_id,
         "fiscal_year": fiscal_year,
         "fiscal_quarter": fiscal_quarter,
-        "document_type": DOCUMENT_TYPE,
     }
     mark_latest(db, RetailerIntelligenceExtract, extract_filter)
     db.flush()
@@ -623,21 +937,33 @@ def _demote_prior_transcript_rows(
 def _detect_contradictions(
     rows: list[tuple[str, Optional[str]]],
 ) -> tuple[int, set[int]]:
-    contradictions = 0
-    flagged: set[int] = set()
-    by_category: dict[str, list[tuple[int, Optional[str]]]] = {}
-    for index, (category, sentiment) in enumerate(rows):
-        by_category.setdefault(category, []).append((index, sentiment))
-    for items in by_category.values():
-        for left_idx in range(len(items)):
-            for right_idx in range(left_idx + 1, len(items)):
-                left_sentiment = items[left_idx][1]
-                right_sentiment = items[right_idx][1]
-                if _sentiments_opposite(left_sentiment, right_sentiment):
-                    contradictions += 1
-                    flagged.add(items[left_idx][0])
-                    flagged.add(items[right_idx][0])
-    return contradictions, flagged
+    # Intra-transcript opposite sentiments within the same category are NOT
+    # contradictions — they reflect the natural richness of a call where
+    # management reports positives and analysts probe negatives. Flagging
+    # them as contradictions poisons the most valuable signal pairs
+    # (analyst-pressure vs. management-response). Contradiction detection
+    # is only meaningful across quarters, not within a single transcript.
+    return 0, set()
+
+
+_DOCUMENT_PRIORITY_BY_SECTION = {
+    "qa": 1,               # Q&A is higher signal density than prepared remarks
+    "prepared_remarks": 2,
+}
+
+
+def _calendar_year_quarter(
+    period_end_date: Optional[date],
+    fiscal_year: int,
+    fiscal_quarter: int,
+) -> tuple[Optional[int], Optional[int]]:
+    """Derive calendar year/quarter from period_end_date, falling back to fiscal labels."""
+    if period_end_date is None:
+        return None, None
+    month = period_end_date.month
+    cal_year = period_end_date.year
+    cal_quarter = (month - 1) // 3 + 1
+    return cal_year, cal_quarter
 
 
 def _write_extract_and_evidence(
@@ -659,6 +985,16 @@ def _write_extract_and_evidence(
     implication_full = (
         str(implication_raw).strip() if implication_raw is not None else None
     )
+    # Store short version only when it fits cleanly; consumers should prefer _full
+    implication_short = (
+        implication_full if implication_full and len(implication_full) <= 500 else None
+    )
+
+    cal_year, cal_quarter = _calendar_year_quarter(
+        quarter_dates.period_end_date, fiscal_year, fiscal_quarter
+    )
+
+    doc_priority = _DOCUMENT_PRIORITY_BY_SECTION.get(passage.section, 3)
 
     extract = RetailerIntelligenceExtract(
         retailer_id=retailer_id,
@@ -670,17 +1006,32 @@ def _write_extract_and_evidence(
         document_section=passage.section,
         source_url=source_url,
         signal_category=signal["signal_category"],
+        canonical_category=signal["signal_category"],  # prompt v4.0 emits canonical taxonomy directly
+        business_segment=(
+            signal.get("business_segment")
+            if signal.get("business_segment") in BUSINESS_SEGMENTS
+            else None
+        ),
         raw_text_passage=passage.text,
         extracted_signal=_truncate(signal.get("extracted_signal"), 500),
         signal_sentiment=_truncate(signal.get("signal_sentiment"), 20),
         signal_strength=_truncate(signal.get("signal_strength"), 20),
-        artemis_implication=_truncate(implication_raw, 500),
+        artemis_implication=implication_short,
         artemis_implication_full=implication_full,
         affected_decision=_truncate(signal.get("affected_decision"), 50),
         confidence_score=_to_decimal(signal.get("confidence_score")),
         speaker=_truncate(passage.speaker_name, 20),
         is_forward_looking=is_forward_looking,
         contains_number=_contains_number(passage.text),
+        number_mentioned=signal.get("number_mentioned"),
+        time_period_referenced=signal.get("time_period_referenced"),
+        time_horizon=(
+            signal.get("time_horizon")
+            if signal.get("time_horizon") in TIME_HORIZONS
+            else "unspecified"
+        ),
+        calendar_year=cal_year,
+        calendar_quarter=cal_quarter,
         extraction_model=EXTRACTION_MODEL,
         extraction_prompt_ver=EXTRACTION_PROMPT_VER,
         human_verified=False,
@@ -700,6 +1051,8 @@ def _write_extract_and_evidence(
         fiscal_year=fiscal_year,
         fiscal_quarter=fiscal_quarter,
         period_end_date=quarter_dates.period_end_date,
+        calendar_year=cal_year,
+        calendar_quarter=cal_quarter,
         document_type=DOCUMENT_TYPE,
         document_section=passage.section,
         source_url=source_url,
@@ -707,8 +1060,10 @@ def _write_extract_and_evidence(
         raw_text_passage=passage.text,
         is_forward_looking=is_forward_looking,
         contains_number=_contains_number(passage.text),
+        number_mentioned=signal.get("number_mentioned"),
+        time_period_referenced=signal.get("time_period_referenced"),
         extraction_confidence=_to_decimal(signal.get("confidence_score")),
-        document_priority=10,
+        document_priority=doc_priority,
         corroborates_master=not has_contradiction,
         contradicts_master=has_contradiction,
         is_analyst_pressure=is_analyst_pressure,
@@ -728,6 +1083,7 @@ def process_transcript(
     db: Optional[Session] = None,
     source_url: Optional[str] = None,
     client: Optional[Anthropic] = None,
+    source_format: str = "motley_fool",
 ) -> IngestionStats:
     """
     Process an earnings transcript from a raw string or .txt file path.
@@ -773,7 +1129,7 @@ def process_transcript(
                     f"retailer_id {retailer_id} not found in major_retailers"
                 )
 
-            passages = parse_transcript(text)
+            passages = parse_transcript(text, source_format=source_format)
             stats.passages_processed = len(passages)
             if not passages:
                 logger.warning("No qualifying passages found in transcript")
@@ -806,9 +1162,12 @@ def process_transcript(
             contradictions, flagged = _detect_contradictions(category_sentiments)
             stats.contradictions_found = contradictions
 
-            _demote_prior_transcript_rows(
-                db, retailer_id, fiscal_year, fiscal_quarter
-            )
+            # Only supersede prior signals when we actually have new ones to write.
+            # A 0-signal extraction (e.g. an API outage) must never empty a quarter.
+            if pending_rows:
+                _demote_prior_transcript_rows(
+                    db, retailer_id, fiscal_year, fiscal_quarter
+                )
             for index, (passage, signal) in enumerate(pending_rows):
                 try:
                     _write_extract_and_evidence(

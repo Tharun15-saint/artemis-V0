@@ -1,8 +1,11 @@
 """
 Backfill weekly historical FX rates from yfinance (2004 → yesterday).
 
-Supplements fx_ingestion.py which owns the live daily is_latest=True row.
-Historical rows are stored with is_latest=False for grn_date-matched lookups.
+The weekly historical series is its own data product with its own is_latest
+lineage (sources: yfinance_historical_weekly + FRED fallback). It forms the
+is_latest=True backbone of fx_rates; the live daily product (fx_ingestion.py,
+exchangerate_api/AlphaVantage) maintains a separate is_latest lineage. The two
+never demote each other, so a date may carry one weekly + one live latest row.
 
 Run:
   python data/ingestion/fx_historical_backfill.py
@@ -38,19 +41,34 @@ SCRIPT_VERSION = "fx-historical-v1.0"
 SOURCE_NAME = "fx_historical_yfinance"
 HISTORICAL_SOURCE = "yfinance_historical_weekly"
 DATA_SOURCE_URL = "https://finance.yahoo.com"
+
+# The historical weekly product's is_latest lineage. A new weekly row demotes
+# only prior rows from these sources for the same date — never the live
+# exchangerate_api/AlphaVantage rows, which are a separate data product.
+FRED_FALLBACK_SOURCE = "FRED_INR_CNY+AV_BDT_VND_PKR_MAD+WB_fallback"
+WEEKLY_SERIES_SOURCES = (HISTORICAL_SOURCE, FRED_FALLBACK_SOURCE)
 DEFAULT_START = date(2004, 1, 1)
 
-TICKERS: dict[str, tuple[str, str, str]] = {
-    "INR": ("INR=X", "usd_inr", "USD_INR"),
-    "BDT": ("BDT=X", "usd_bdt", "USD_BDT"),
-    "VND": ("VND=X", "usd_vnd", "USD_VND"),
-    "CNY": ("CNY=X", "usd_cny", "USD_CNY"),
-    "TRY": ("TRY=X", "usd_try", "USD_TRY"),
-    "MAD": ("MAD=X", "usd_mad", "USD_MAD"),
-    "PKR": ("PKR=X", "usd_pkr", "USD_PKR"),
+# (yfinance_symbol, field_on_model, validation_pair, invert_flag)
+# yfinance INR=X gives INR per USD → usd_inr directly (no inversion)
+# yfinance EURUSD=X gives USD per EUR → eur_usd directly (no inversion)
+# yfinance GBPUSD=X gives USD per GBP → gbp_usd directly (no inversion)
+TICKERS: dict[str, tuple[str, str, str, bool]] = {
+    "INR": ("INR=X",    "usd_inr", "USD_INR", False),
+    "BDT": ("BDT=X",    "usd_bdt", "USD_BDT", False),
+    "VND": ("VND=X",    "usd_vnd", "USD_VND", False),
+    "CNY": ("CNY=X",    "usd_cny", "USD_CNY", False),
+    "TRY": ("TRY=X",    "usd_try", "USD_TRY", False),
+    "MAD": ("MAD=X",    "usd_mad", "USD_MAD", False),
+    "PKR": ("PKR=X",    "usd_pkr", "USD_PKR", False),
+    "IDR": ("IDR=X",    "usd_idr", "USD_IDR", False),
+    "KHR": ("KHR=X",    "usd_khr", "USD_KHR", False),
+    "EUR": ("EURUSD=X", "eur_usd", "EUR_USD", False),
+    "GBP": ("GBPUSD=X", "gbp_usd", "GBP_USD", False),
+    # LKR, MXN, THB handled by fx_fred_rebuild.py (FRED DEXSLUS/DEXMXUS/DEXTHUS — better quality)
 }
 
-FX_FIELDS = tuple(field for _, field, _ in TICKERS.values())
+FX_FIELDS = tuple(field for _, field, _, _ in TICKERS.values())
 
 
 def _yesterday() -> date:
@@ -94,7 +112,7 @@ def fetch_weekly_series(
 def fetch_all_weekly_rates(start: date, end: date) -> dict[date, dict[str, Decimal]]:
     """Merge all currency weekly series into one dict per week date."""
     by_week: dict[date, dict[str, Decimal]] = {}
-    for code, (symbol, field, _) in TICKERS.items():
+    for code, (symbol, field, _pair, _invert) in TICKERS.items():
         series = fetch_weekly_series(symbol, start, end)
         for week_date, rate in series.items():
             by_week.setdefault(week_date, {})[field] = rate
@@ -107,8 +125,9 @@ def _historical_week_exists(db: Session, as_of_date: date) -> bool:
     """
     Idempotency check keyed on as_of_date (per is_duplicate_row intent).
 
-    is_duplicate_row() only queries is_latest=True live rows; historical
-    backfill rows use is_latest=False, so we check as_of_date + source.
+    is_duplicate_row() checks (as_of_date, value) within the live product only.
+    The weekly product maintains its own is_latest lineage, so idempotency here is
+    keyed on as_of_date + HISTORICAL_SOURCE (one weekly row per date).
     """
     return (
         db.query(FxRates)
@@ -130,7 +149,7 @@ def _validate_week_rates(
     genuine currency movements over 20 years exceed that threshold regularly.
     """
     validated: dict[str, Decimal] = {}
-    for _code, (_, field, pair) in TICKERS.items():
+    for _code, (_sym, field, pair, _invert) in TICKERS.items():
         rate = raw_rates.get(field)
         if rate is None:
             continue
@@ -173,6 +192,16 @@ def backfill_fx_history(
                 ctx.stale()
                 continue
 
+            # Demote only prior weekly-product rows for this date; leave the live
+            # exchangerate_api/AlphaVantage lineage untouched. The new weekly row
+            # becomes the latest of the historical product (is_latest=True), so it
+            # is visible in the is_latest view alongside any live row for the date.
+            db.query(FxRates).filter(
+                FxRates.as_of_date == week_date,
+                FxRates.source.in_(WEEKLY_SERIES_SOURCES),
+                FxRates.is_latest.is_(True),
+            ).update({"is_latest": False}, synchronize_session="fetch")
+
             record = FxRates(
                 usd_inr=validated.get("usd_inr"),
                 usd_bdt=validated.get("usd_bdt"),
@@ -181,13 +210,18 @@ def backfill_fx_history(
                 usd_try=validated.get("usd_try"),
                 usd_mad=validated.get("usd_mad"),
                 usd_pkr=validated.get("usd_pkr"),
+                usd_idr=validated.get("usd_idr"),
+                usd_khr=validated.get("usd_khr"),
+                eur_usd=validated.get("eur_usd"),
+                gbp_usd=validated.get("gbp_usd"),
+                # usd_lkr, usd_mxn, usd_thb populated by fx_fred_rebuild.py
                 as_of_date=week_date,
                 source=HISTORICAL_SOURCE,
                 data_source_url=DATA_SOURCE_URL,
                 refresh="weekly",
                 status="historical",
                 pulled_at=datetime.now(timezone.utc),
-                is_latest=False,
+                is_latest=True,
             )
             db.add(record)
             ctx.inserted()

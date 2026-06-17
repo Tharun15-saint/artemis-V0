@@ -1,5 +1,9 @@
-# Database — never upload this
+# Database — never upload this (Postgres/Timescale is the source of truth now;
+# SQLite files are kept locally only as a migration rollback)
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 *.sqlite
 *.sqlite3
 

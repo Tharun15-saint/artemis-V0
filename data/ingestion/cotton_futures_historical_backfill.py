@@ -1,9 +1,18 @@
 """
 Historical cotton futures curve backfill — S/U-calibrated synthetic curve on all origins.
 
-Near-month prices from yfinance CT=F (weekly, 2011+). Forward tenors derived from
-the WASDE stocks-to-use ratio stored on each cotton row (default 50% when missing).
+PERMANENTLY DISABLED. This script generates fabricated ICE futures curves using
+WASDE S/U calibration. That is synthetic data. It corrupts model training.
+
+Real historical ICE futures backfill is in cotton_ice_historical_backfill.py.
 """
+raise SystemExit(
+    "\n"
+    "PERMANENTLY DISABLED — cotton_futures_historical_backfill.py\n"
+    "This script writes S/U-calibrated synthetic futures curves to the database.\n"
+    "Synthetic futures data is worse than no data for model training.\n"
+    "Use cotton_ice_historical_backfill.py for real ICE contract history.\n"
+)
 
 from __future__ import annotations
 

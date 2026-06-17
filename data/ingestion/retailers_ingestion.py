@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from data.ingestion._env import load_project_env
 from database.database import SessionLocal
-from database.models.retail import DemandSignals, MajorRetailers
+from database.models.retail import DemandSignals, MajorRetailers, RetailerFinancials
 
 load_project_env()
 
@@ -58,10 +58,14 @@ XBRL_CONCEPTS = {
     "operating_income": ["OperatingIncomeLoss"],
 }
 
-APPAREL_REVENUE_CONCEPTS = [
-    "SalesRevenueGoodsNet",
-    "RevenueFromContractWithCustomerExcludingAssessedTax",
-]
+# XBRL does not tag apparel segment revenue at the concept level for these
+# diversified retailers — it requires reading segment footnote disclosures
+# which are in the HTML filings, not the structured XBRL facts.
+# Target apparel is parsed via _parse_inline_apparel_revenue() in target_tier1.
+# Leaving this empty avoids returning total company revenue as apparel revenue,
+# which was the previous bug (RevenueFromContractWithCustomerExcludingAssessedTax
+# is total revenue, not apparel-segmented).
+APPAREL_REVENUE_CONCEPTS: list[str] = []
 
 GUIDANCE_PATTERNS = [
     "we expect",
@@ -476,11 +480,11 @@ def _extract_apparel_revenue(
     us_gaap: dict[str, Any],
     latest_quarter: tuple[int, int],
 ) -> Optional[Decimal]:
-    apparel = extract_quarterly_values(us_gaap, APPAREL_REVENUE_CONCEPTS, instant=False)
-    value = apparel.get(latest_quarter)
-    if value is None:
-        return None
-    return value
+    # XBRL structured facts do not carry apparel segment revenue for these
+    # diversified retailers. Returns None; apparel_revenue is populated by
+    # the retailer-specific Tier 1 scripts (target_tier1, walmart_tier1)
+    # via HTML inline XBRL parsing of the actual segment disclosures.
+    return None
 
 
 def fetch_retailer_facts(cik: str) -> Optional[tuple[dict[str, Any], dict[str, Any]]]:
@@ -628,6 +632,7 @@ def _next_demand_signal_id(db: Session) -> int:
 
 
 def upsert_major_retailer(db: Session, payload: dict[str, Any]) -> MajorRetailers:
+    """Upsert identity-only fields — financial data goes to RetailerFinancials."""
     existing = (
         db.query(MajorRetailers).filter(MajorRetailers.name == payload["name"]).first()
     )
@@ -639,50 +644,105 @@ def upsert_major_retailer(db: Session, payload: dict[str, Any]) -> MajorRetailer
         )
         db.add(existing)
 
-    existing.store_count = payload.get("store_count")
-    existing.total_sales = payload.get("total_sales")
-    existing.apparel_revenue = payload.get("apparel_revenue")
-    existing.gross_margin = payload.get("gross_margin")
-    existing.inventory_turnover = payload.get("inventory_turnover")
-    existing.forward_guidance = payload.get("forward_guidance")
+    existing.cik = payload.get("cik")
+    existing.ticker = payload.get("ticker")
     existing.source = SOURCE_LABEL
     existing.status = "LIVE"
 
     return existing
 
 
-def upsert_demand_signal(
+def upsert_retailer_financials_from_xbrl(
+    db: Session,
+    retailer_id: int,
+    payload: dict[str, Any],
+) -> RetailerFinancials:
+    """Append-only write of XBRL-derived financials to retailer_financials.
+
+    Demotes the previous is_latest=True row for the same (retailer_id, fiscal_year,
+    fiscal_quarter) slot before inserting a fresh row. This keeps full history while
+    allowing the engine to query with is_latest=True for the current snapshot.
+    """
+    fiscal_year, fiscal_quarter = payload["latest_quarter"]
+    cik = payload.get("cik", "")
+    companyfacts_url = _COMPANYFACTS_URL.format(cik=cik)
+
+    (
+        db.query(RetailerFinancials)
+        .filter(
+            RetailerFinancials.retailer_id == retailer_id,
+            RetailerFinancials.fiscal_year == fiscal_year,
+            RetailerFinancials.fiscal_quarter == fiscal_quarter,
+            RetailerFinancials.is_latest.is_(True),
+        )
+        .update({"is_latest": False}, synchronize_session=False)
+    )
+
+    row = RetailerFinancials(
+        retailer_id=retailer_id,
+        fiscal_year=fiscal_year,
+        fiscal_quarter=fiscal_quarter,
+        total_net_sales_usd=payload.get("total_sales"),
+        gross_margin_pct=payload.get("gross_margin"),
+        store_count_total=payload.get("store_count"),
+        xbrl_extracted=True,
+        source=SOURCE_LABEL,
+        data_source_url=companyfacts_url,
+        is_latest=True,
+    )
+    db.add(row)
+    return row
+
+
+def append_demand_signal(
     db: Session,
     retailer_id: int,
     payload: dict[str, Any],
 ) -> DemandSignals:
-    existing = (
+    """Append a new demand_signals row with temporal keys, demoting previous is_latest rows.
+
+    Replaces the old upsert pattern (single overwritten row) with proper
+    append-only discipline: one row per (retailer_id, fiscal_year, fiscal_quarter).
+    """
+    fiscal_year, fiscal_quarter = payload["latest_quarter"]
+    cik = payload.get("cik", "")
+
+    (
         db.query(DemandSignals)
-        .filter(DemandSignals.retailer_id == retailer_id)
-        .first()
+        .filter(
+            DemandSignals.retailer_id == retailer_id,
+            DemandSignals.is_latest.is_(True),
+        )
+        .update({"is_latest": False}, synchronize_session=False)
     )
 
-    if existing is None:
-        existing = DemandSignals(
-            demand_signal_id=_next_demand_signal_id(db),
-            retailer_id=retailer_id,
-        )
-        db.add(existing)
-
-    existing.store_expansion = payload["store_expansion"]
-    existing.inventory_improving = payload["inventory_improving"]
-    existing.margin_compression = payload["margin_compression"]
-    existing.buying_volume_signal = payload["buying_volume_signal"]
-    existing.status = "LIVE"
-
-    return existing
+    row = DemandSignals(
+        demand_signal_id=_next_demand_signal_id(db),
+        retailer_id=retailer_id,
+        fiscal_year=fiscal_year,
+        fiscal_quarter=fiscal_quarter,
+        store_expansion=payload["store_expansion"],
+        inventory_improving=payload["inventory_improving"],
+        margin_compression=payload["margin_compression"],
+        buying_volume_signal=payload["buying_volume_signal"],
+        revenue_growth_pct=payload.get("revenue_growth_pct"),
+        turnover_change_pct=payload.get("turnover_change_pct"),
+        margin_change_pct=payload.get("margin_change_pct"),
+        status="LIVE",
+        source=SOURCE_LABEL,
+        data_source_url=_COMPANYFACTS_URL.format(cik=cik),
+        is_latest=True,
+    )
+    db.add(row)
+    return row
 
 
 def write_retailer_to_db(db: Session, payload: dict[str, Any]) -> bool:
     try:
         retailer_row = upsert_major_retailer(db, payload)
         db.flush()
-        upsert_demand_signal(db, retailer_row.retailer_id, payload)
+        upsert_retailer_financials_from_xbrl(db, retailer_row.retailer_id, payload)
+        append_demand_signal(db, retailer_row.retailer_id, payload)
         db.commit()
         db.refresh(retailer_row)
         return True

@@ -12,7 +12,7 @@ from decimal import Decimal
 from typing import Any, Optional
 
 import anthropic
-from sqlalchemy import desc
+from sqlalchemy import desc, text
 from sqlalchemy.orm import Session
 
 from data.ingestion._env import load_project_env
@@ -23,19 +23,27 @@ from database.models import (
     CompanyProfile,
     CostLayerPrior,
     CostVariablePrior,
+    BunkerFuelPrices,
     CottonSupplyDemand,
     CrudeOil,
     FactoryFinancingCost,
     FxRates,
     GeopoliticalRiskEvent,
     GovernmentExportIncentive,
+    HedgeOpportunityRecommendation,
+    LearnedCoefficient,
     MarineInsurance,
     OceanFreightRates,
+    PolyesterPetChips,
+    Program,
     PurchaseOrderHistory,
+    PxParaxylene,
     ShippingLaneRisk,
     UsImportDutyRate,
 )
 from intelligence.cost_reasoning.engine import CostReasoningEngine, ProgramSpec
+from intelligence.crude_cost_inputs import CrudeCostInputs
+from intelligence.exceptions import CrudeDataStaleError
 
 load_project_env()
 
@@ -60,12 +68,9 @@ CORRIDOR_FX = {
     "Pakistan": "usd_pkr",
 }
 
-FREIGHT_CORRIDORS = {
-    "bangladesh_la": ("chittagong_la_usd", "Bangladesh"),
-    "india_la": ("chennai_la_usd", "India"),
-    "vietnam_la": ("hcmc_la_usd", "Vietnam"),
-    "china_la": ("shanghai_la_usd", "China"),
-}
+# Ocean freight is stored one row per (origin_port, destination_port) corridor
+# since migration 353dd690a9d9 — not wide columns. get_freight_snapshot iterates
+# over is_latest rows directly. The 40ft high-cube rate is the published WCI unit.
 
 SYSTEM_PROMPT_MARKET_BRIEF = """
 You are Artemis — an apparel supply chain intelligence system built for
@@ -466,6 +471,8 @@ def get_fx_snapshot(db: Session) -> dict:
 
 
 def get_crude_oil_snapshot(db: Session) -> dict:
+    from database.constants import CRUDE_OIL_DYEING_PRESSURE_THRESHOLD, CRUDE_OIL_LEVEL_THRESHOLDS, STALENESS
+
     latest = (
         db.query(CrudeOil)
         .filter(CrudeOil.is_latest.is_(True))
@@ -474,7 +481,7 @@ def get_crude_oil_snapshot(db: Session) -> dict:
     )
     if not latest:
         return {
-            "gaps": ["No crude oil data"],
+            "gaps": ["No crude oil data — run: python -m data.ingestion.crude_oil_ingestion --backfill"],
             "quality_score": 0.0,
             "freshness_days": 999,
         }
@@ -482,24 +489,30 @@ def get_crude_oil_snapshot(db: Session) -> dict:
     brent = float(latest.brent_spot)
     wti = float(latest.wti_spot)
     freshness = _days_old(latest.as_of_date)
+    gaps: list[str] = []
 
-    def _pct_change(days: int) -> Optional[float]:
-        prior = (
-            db.query(CrudeOil)
-            .filter(
-                CrudeOil.is_latest.is_(True),
-                CrudeOil.as_of_date <= latest.as_of_date - timedelta(days=days),
-            )
-            .order_by(desc(CrudeOil.as_of_date))
-            .first()
+    # Use materialized trend_30d_pct — avoids a DB round-trip that previously
+    # re-queried 800 rows to find the prior value.
+    ch30 = float(latest.trend_30d_pct) if latest.trend_30d_pct is not None else None
+    if ch30 is None:
+        gaps.append("trend_30d_pct NULL on latest row — run crude_oil_cleanup.py")
+        ch30 = 0.0
+
+    # 90d still requires a live query (not materialized)
+    prior_90d = (
+        db.query(CrudeOil)
+        .filter(
+            CrudeOil.is_latest.is_(True),
+            CrudeOil.as_of_date <= latest.as_of_date - timedelta(days=90),
         )
-        if not prior:
-            return None
-        p = float(prior.brent_spot)
-        return (brent - p) / p * 100 if p else None
+        .order_by(desc(CrudeOil.as_of_date))
+        .first()
+    )
+    ch90 = 0.0
+    if prior_90d and prior_90d.brent_spot:
+        p = float(prior_90d.brent_spot)
+        ch90 = (brent - p) / p * 100 if p else 0.0
 
-    ch30 = _pct_change(30) or 0.0
-    ch90 = _pct_change(90) or 0.0
     trend = "stable"
     magnitude = "gradual"
     if ch30 > 3:
@@ -509,12 +522,206 @@ def get_crude_oil_snapshot(db: Session) -> dict:
         trend = "falling"
         magnitude = "sharp" if ch30 < -8 else "moderate"
 
-    dye_pressure = "elevated" if brent > 85 else ("reduced" if brent < 65 else "normal")
-    dye_note = (
-        f"Dark colour dyeing costs under upward pressure. Brent at ${brent:.2f}/bbl (above $85 threshold)."
-        if brent > 85
-        else f"Brent at ${brent:.2f}/bbl — dye chemical costs within normal range."
+    # Spread: Brent - WTI (normally +$2-5; widening = tighter Asian/European crude supply)
+    spread = (
+        float(latest.brent_wti_spread_usd)
+        if latest.brent_wti_spread_usd is not None
+        else brent - wti
     )
+    spread_signal = "normal"
+    if spread > 10:
+        spread_signal = "wide — Asian crude supply tighter than US, chemical import premiums elevated"
+    elif spread < 0:
+        spread_signal = "inverted — unusual market structure, monitor for supply disruption"
+
+    # INR price — the anchor for polyester cost chain in Tirupur
+    brent_inr = (
+        float(latest.brent_inr_per_barrel)
+        if latest.brent_inr_per_barrel is not None
+        else None
+    )
+    if brent_inr is None:
+        gaps.append("brent_inr_per_barrel NULL — run crude_oil_cleanup.py for FX materialization")
+
+    # Dyeing chemical pressure uses the constant threshold (Brent-indexed)
+    dye_threshold = float(CRUDE_OIL_DYEING_PRESSURE_THRESHOLD)
+    if brent > dye_threshold:
+        dye_pressure = "elevated"
+        dye_note = (
+            f"Dark colour dyeing costs under upward pressure. "
+            f"Brent ${brent:.2f}/bbl exceeds ${dye_threshold:.0f} threshold. "
+            f"Azo-free disperse dyes and reactive dye carriers are petroleum derivatives. "
+            f"Estimated impact: +$0.08–0.15/dozen on dark-colour programs."
+        )
+    elif brent < 65:
+        dye_pressure = "reduced"
+        dye_note = (
+            f"Brent ${brent:.2f}/bbl — dye chemical costs below normal range. "
+            f"Minor cost relief on dark-colour programs."
+        )
+    else:
+        dye_pressure = "normal"
+        dye_note = f"Brent ${brent:.2f}/bbl — dye chemical costs within normal operating range."
+
+    # Crude oil futures forward curve — contango vs backwardation signal
+    crude_futures: dict = {}
+    latest_futures = (
+        db.query(CommodityFutures)
+        .filter(
+            CommodityFutures.is_latest.is_(True),
+            CommodityFutures.brent_3m_fwd.isnot(None),
+        )
+        .order_by(desc(CommodityFutures.as_of_date))
+        .first()
+    )
+    if latest_futures:
+        def _f(v) -> float | None:
+            return float(v) if v is not None else None
+        crude_futures = {
+            # Brent forwards (USD/bbl) — EIA STEO BREPUUS forecast
+            "brent_3m_fwd": _f(latest_futures.brent_3m_fwd),
+            "brent_6m_fwd": _f(latest_futures.brent_6m_fwd),
+            "brent_9m_fwd": _f(latest_futures.brent_9m_fwd),
+            "brent_12m_fwd": _f(latest_futures.brent_12m_fwd),
+            # WTI forwards (USD/bbl) — EIA STEO WTIPUUS forecast
+            "wti_3m_fwd": _f(latest_futures.wti_3m_fwd),
+            "wti_6m_fwd": _f(latest_futures.wti_6m_fwd),
+            "wti_9m_fwd": _f(latest_futures.wti_9m_fwd),
+            "wti_12m_fwd": _f(latest_futures.wti_12m_fwd),
+            # Contango signals (forward vs spot / spot × 100)
+            "brent_3m_contango_pct": _f(latest_futures.brent_3m_contango_pct),
+            "brent_9m_contango_pct": _f(latest_futures.brent_9m_contango_pct),
+            "brent_12m_contango_pct": _f(latest_futures.brent_12m_contango_pct),
+            "wti_3m_contango_pct": _f(latest_futures.wti_3m_contango_pct),
+            "wti_12m_contango_pct": _f(latest_futures.wti_12m_contango_pct),
+            # Summary signal and metadata
+            "curve_signal": latest_futures.crude_curve_signal,
+            "source": latest_futures.crude_source,
+            "futures_as_of": latest_futures.as_of_date.isoformat() if latest_futures.as_of_date else None,
+        }
+        curve_note = {
+            "contango": "EIA forecasts crude prices to remain elevated over next 12 months — polyester chain cost pressure persists.",
+            "backwardation": "EIA forecasts crude decline over next 12 months — polyester cost pressure transient; no urgency to hedge input costs.",
+            "flat": "EIA sees little crude price change over next 12 months — cost planning stable.",
+        }.get(latest_futures.crude_curve_signal or "flat", "")
+        crude_futures["curve_note"] = curve_note
+    else:
+        gaps.append(
+            "Crude futures not available — run: python -m data.ingestion.crude_oil_futures_ingestion "
+            "(requires EIA_API_KEY from https://www.eia.gov/opendata/)"
+        )
+
+    # Polyester chain proxy prices (crude-derived, is_proxy=True)
+    polyester_chain: dict = {}
+    latest_px = (
+        db.query(PxParaxylene)
+        .filter(PxParaxylene.is_latest.is_(True), PxParaxylene.spot_usd_tonne.isnot(None))
+        .order_by(desc(PxParaxylene.as_of_date))
+        .first()
+    )
+    latest_chip = (
+        db.query(PolyesterPetChips)
+        .filter(PolyesterPetChips.is_latest.is_(True), PolyesterPetChips.spot_usd_tonne.isnot(None))
+        .order_by(desc(PolyesterPetChips.as_of_date))
+        .first()
+    )
+    if latest_px:
+        polyester_chain["px_spot_usd_tonne"] = float(latest_px.spot_usd_tonne)
+        polyester_chain["crude_to_px_ratio"] = float(latest_px.crude_to_px_ratio) if latest_px.crude_to_px_ratio else None
+        polyester_chain["px_is_proxy"] = bool(latest_px.is_proxy)
+        polyester_chain["px_as_of"] = latest_px.as_of_date.isoformat() if latest_px.as_of_date else None
+    if latest_chip:
+        polyester_chain["chip_spot_usd_tonne"] = float(latest_chip.spot_usd_tonne)
+        polyester_chain["chip_is_proxy"] = bool(latest_chip.is_proxy)
+
+    # Hedge opportunity recommendation — driven by crude_market_structure (NYMEX spread)
+    # from eia_petroleum_futures rows. Contango + polyester exposure → hedge input costs now.
+    hedge_opportunity_recommendation: Optional[dict] = None
+    try:
+        crude_inputs = CrudeCostInputs(db)
+        forward = crude_inputs.get_forward_input(
+            delivery_date=date.today() + timedelta(days=90),
+            as_of_date=date.today(),
+        )
+        market_structure = forward.get("market_structure")
+        if market_structure == "contango" and polyester_chain:
+            hedge_opportunity_recommendation = {
+                "action": "hedge_polyester_input_costs",
+                "rationale": (
+                    "Crude oil in CONTANGO: forward prices exceed spot, indicating the market "
+                    "expects crude to remain elevated. Polyester yarn and dye chemical costs will "
+                    "build over the next 90 days. Operators with >20% polyester blend exposure "
+                    "should consider locking in current input prices."
+                ),
+                "market_structure": market_structure,
+                "brent_futures_3m": float(forward["brent_futures"]) if forward.get("brent_futures") else None,
+                "tenor": forward.get("tenor_used"),
+                "urgency": "high" if polyester_chain.get("px_spot_usd_tonne") else "medium",
+                "source_row_id": forward.get("source_row_id"),
+            }
+        elif market_structure == "backwardation":
+            hedge_opportunity_recommendation = {
+                "action": "no_hedge_needed",
+                "rationale": (
+                    "Crude oil in BACKWARDATION: forward prices below spot. "
+                    "Polyester cost pressure is transient — no urgency to lock in input costs."
+                ),
+                "market_structure": market_structure,
+                "brent_futures_3m": float(forward["brent_futures"]) if forward.get("brent_futures") else None,
+                "tenor": forward.get("tenor_used"),
+            }
+    except (CrudeDataStaleError, Exception) as exc:
+        logger.debug(f"hedge_opportunity_recommendation: could not build ({exc})")
+        hedge_opportunity_recommendation = None
+
+    # Transmission lag coefficients (seeded in learned_coefficient)
+    lag_coefficients: dict = {}
+    for coef_name in ("crude_to_dye_chemical_lag_weeks", "crude_to_polyester_yarn_lag_weeks"):
+        row = (
+            db.query(LearnedCoefficient)
+            .filter(
+                LearnedCoefficient.coefficient_name == coef_name,
+                LearnedCoefficient.is_active.is_(True),
+            )
+            .first()
+        )
+        if row:
+            lag_coefficients[coef_name] = {
+                "value": float(row.value),
+                "unit": row.unit,
+                "confidence_tier": row.confidence_tier,
+            }
+
+    # Build polyester chain pressure signal with real proxy prices.
+    # Transmission lags (crude→dye_chemical, crude→polyester_yarn) are NOT included:
+    # lag coefficients are marked uncalibrated pending RRK invoice data ingestion.
+    # Once RRK dye chemical and polyester yarn invoices are ingested and correlated
+    # against historical Brent prices, these lags will be measured and reactivated.
+    proxy_note = " (crude-derived proxy ±20% accuracy)" if polyester_chain.get("px_is_proxy") else ""
+    px_price = polyester_chain.get("px_spot_usd_tonne")
+    chip_price = polyester_chain.get("chip_spot_usd_tonne")
+    lag_pending_note = " Transmission lag to RRK costs uncalibrated — needs invoice corpus."
+
+    if trend == "rising" and brent > float(CRUDE_OIL_LEVEL_THRESHOLDS["elevated"]):
+        poly_signal = (
+            f"BUILDING — Brent ${brent:.2f}/bbl rising ({ch30:+.1f}% in 30d). "
+            + (f"PX proxy ${px_price:.0f}/tonne, chip proxy ${chip_price:.0f}/tonne{proxy_note}. " if px_price else "")
+            + "Upward pressure on dye chemicals and polyester yarn expected."
+            + lag_pending_note
+        )
+    elif trend == "falling":
+        poly_signal = (
+            f"EASING — Brent falling {abs(ch30):.1f}% in 30d. "
+            + (f"PX proxy ${px_price:.0f}/tonne, chip proxy ${chip_price:.0f}/tonne{proxy_note}. " if px_price else "")
+            + "Cost relief expected on dye chemicals and polyester yarn."
+            + lag_pending_note
+        )
+    else:
+        poly_signal = (
+            f"STABLE — Brent ${brent:.2f}/bbl ({ch30:+.1f}% 30d). "
+            + (f"PX proxy ${px_price:.0f}/tonne, chip proxy ${chip_price:.0f}/tonne{proxy_note}. " if px_price else "")
+            + "Normal polyester chain pressure."
+        )
 
     conflict_events = (
         db.query(GeopoliticalRiskEvent)
@@ -526,27 +733,41 @@ def get_crude_oil_snapshot(db: Session) -> dict:
     )
     geo_premium = len(conflict_events) > 0
     geo_note = (
-        "Active armed conflict events may affect chemical import routes and premiums."
+        "Active armed conflict events detected — chemical import routes and spot premiums may be affected."
         if geo_premium
         else ""
     )
 
+    if freshness > STALENESS["crude_oil_error"]:
+        gaps.append(
+            f"Crude oil data {freshness} days old — exceeds {STALENESS['crude_oil_error']}d error threshold. "
+            f"Run: python -m data.ingestion.crude_oil_ingestion --run-once"
+        )
+    elif freshness > STALENESS["crude_oil_warn"]:
+        gaps.append(
+            f"Crude oil data {freshness} days old — exceeds {STALENESS['crude_oil_warn']}d warn threshold."
+        )
+
     return {
         "brent_usd": brent,
         "wti_usd": wti,
+        "brent_wti_spread_usd": spread,
+        "brent_wti_spread_signal": spread_signal,
+        "brent_inr_per_barrel": brent_inr,
         "brent_30d_change_pct": ch30,
         "brent_90d_change_pct": ch90,
+        "aggregation_period": latest.aggregation_period,
         "trend": trend,
         "trend_magnitude": magnitude,
+        "crude_futures": crude_futures,
+        "polyester_chain": polyester_chain,
+        "transmission_lags": lag_coefficients,
         "dyeing_chemical_pressure": dye_pressure,
         "dyeing_chemical_note": dye_note,
-        "polyester_chain_pressure": (
-            "Elevated — crude drives PX/PTA/polyester chip costs higher with 4-8 week lag"
-            if trend == "rising"
-            else "Normal polyester chain pressure at current crude levels"
-        ),
+        "polyester_chain_pressure": poly_signal,
         "local_freight_implication": (
-            "Diesel-linked factory-to-port costs under upward pressure"
+            "Diesel-linked factory-to-port costs under upward pressure — "
+            f"estimated +${brent * 0.0008:.2f}/dozen on India corridor"
             if trend == "rising"
             else "Local freight energy costs stable at current crude levels"
         ),
@@ -554,8 +775,252 @@ def get_crude_oil_snapshot(db: Session) -> dict:
         "geopolitical_premium_note": geo_note,
         "data_as_of": latest.as_of_date.isoformat(),
         "freshness_days": freshness,
-        "quality_score": round(_quality_from_freshness(freshness, 7, 0.9), 3),
-        "gaps": [],
+        "quality_score": round(
+            _quality_from_freshness(freshness, STALENESS["crude_oil_error"], 0.9), 3
+        ),
+        "gaps": gaps,
+        "hedge_opportunity_recommendation": hedge_opportunity_recommendation,
+    }
+
+
+# Crude pressure level thresholds (USD/bbl, brent_rolling_4w_avg)
+_CRUDE_PRESSURE_BANDS = [(70.0, "low"), (90.0, "moderate"), (110.0, "elevated")]
+_RETAILER_RECENCY_DAYS = 90
+_CRUDE_RECENCY_DAYS = 7
+
+
+def _crude_pressure_level(rolling_4w: float) -> str:
+    for ceiling, label in _CRUDE_PRESSURE_BANDS:
+        if rolling_4w < ceiling:
+            return label
+    return "high"
+
+
+def _retailer_health_from_signal(buying: str, inventory: str, margin: str) -> str:
+    """Map one retailer's demand_signals row to a health enum.
+    strong / mixed / weak / critical."""
+    buying = (buying or "").lower()
+    margin = (margin or "").lower()
+    negative = buying in ("reducing", "declining", "decreasing") or margin == "compressing"
+    positive = buying in ("increasing", "expanding") and margin != "compressing"
+    if negative and margin == "compressing" and buying in ("reducing", "declining", "decreasing"):
+        return "critical"
+    if negative:
+        return "weak"
+    if positive:
+        return "strong"
+    return "mixed"
+
+
+# severity ordering for taking the worst across retailers
+_HEALTH_RANK = {"strong": 0, "mixed": 1, "weak": 2, "critical": 3}
+_RANK_HEALTH = {v: k for k, v in _HEALTH_RANK.items()}
+
+
+def get_crude_retailer_demand_composite(db: Session, as_of_date: date) -> dict:
+    """Composite of crude price environment AND retailer demand health.
+
+    NOT a prediction and NOT a recommendation. It reports two real, recent data
+    points (crude pressure + retailer demand health) and their historical
+    co-occurrence with order-cancellation risk. The operator decides what to do.
+
+    Returns None components (data_complete=False) when either source is stale:
+      crude requires an eia_daily row < 7 days old,
+      retailer requires demand_signals < 90 days old.
+    Does NOT write to any output table.
+    """
+    result: dict = {
+        "crude_brent_rolling_4w": None, "crude_pressure_level": None,
+        "crude_data_as_of": None, "crude_data_age_days": None,
+        "retailer_demand_health": None, "retailer_data_as_of": None,
+        "retailer_data_age_days": None,
+        "composite_risk_flag": None, "composite_note": "", "historical_analogs": [],
+        "data_complete": False,
+    }
+
+    # ── Crude component (eia_daily primary, daily resolution) ──────────────────
+    crude_row = db.execute(text("""
+        SELECT as_of_date, CAST(brent_rolling_4w_avg AS REAL)
+        FROM crude_oil
+        WHERE source = 'eia_daily' AND brent_rolling_4w_avg IS NOT NULL
+        ORDER BY as_of_date DESC LIMIT 1
+    """)).fetchone()
+    crude_ok = False
+    if crude_row is not None and crude_row[1] is not None:
+        c_date = crude_row[0] if isinstance(crude_row[0], date) else date.fromisoformat(str(crude_row[0]))
+        c_age = (as_of_date - c_date).days
+        result["crude_data_as_of"] = c_date.isoformat()
+        result["crude_data_age_days"] = c_age
+        if c_age <= _CRUDE_RECENCY_DAYS:
+            result["crude_brent_rolling_4w"] = round(crude_row[1], 2)
+            result["crude_pressure_level"] = _crude_pressure_level(crude_row[1])
+            crude_ok = True
+        else:
+            logger.warning("crude_retailer_composite: eia_daily stale (%dd) — crude component None.", c_age)
+
+    # ── Retailer component (worst demand health across tracked retailers) ──────
+    cutoff = (as_of_date - timedelta(days=_RETAILER_RECENCY_DAYS)).isoformat()
+    retailer_rows = db.execute(text("""
+        SELECT retailer_id, buying_volume_signal, inventory_improving, margin_compression,
+               COALESCE(period_end_date, date(created_at)) AS sig_date
+        FROM demand_signals
+        WHERE is_latest = 1 AND COALESCE(period_end_date, date(created_at)) >= :cutoff
+    """), {"cutoff": cutoff}).fetchall()
+    retailer_ok = False
+    if retailer_rows:
+        worst_rank, latest_sig = -1, None
+        for rid, buying, inv, margin, sig_date in retailer_rows:
+            h = _retailer_health_from_signal(buying, inv, margin)
+            if _HEALTH_RANK[h] > worst_rank:
+                worst_rank = _HEALTH_RANK[h]
+            d = sig_date if isinstance(sig_date, date) else date.fromisoformat(str(sig_date))
+            if latest_sig is None or d > latest_sig:
+                latest_sig = d
+        result["retailer_demand_health"] = _RANK_HEALTH[worst_rank]
+        result["retailer_data_as_of"] = latest_sig.isoformat() if latest_sig else None
+        result["retailer_data_age_days"] = (as_of_date - latest_sig).days if latest_sig else None
+        retailer_ok = True
+
+    # ── Composite (only when both components present) ──────────────────────────
+    if crude_ok and retailer_ok:
+        result["data_complete"] = True
+        crude_elevated = result["crude_pressure_level"] in ("elevated", "high")
+        retailer_weak = result["retailer_demand_health"] in ("weak", "critical")
+        if crude_elevated and retailer_weak:
+            result["composite_risk_flag"] = True
+            result["composite_note"] = (
+                f"Crude pressure {result['crude_pressure_level']} "
+                f"(${result['crude_brent_rolling_4w']}/bbl 4w avg) coincides with "
+                f"{result['retailer_demand_health']} retailer demand — historically associated "
+                f"with discretionary-apparel spending compression and elevated order-cancellation risk."
+            )
+            result["historical_analogs"] = _crude_demand_analogs(db)
+        else:
+            result["composite_risk_flag"] = False
+            result["composite_note"] = (
+                f"Crude pressure {result['crude_pressure_level']}, retailer demand "
+                f"{result['retailer_demand_health']} — combination not historically associated "
+                f"with elevated cancellation risk."
+            )
+    else:
+        missing = []
+        if not crude_ok:
+            missing.append(f"crude (eia_daily {'stale' if crude_row else 'absent'})")
+        if not retailer_ok:
+            missing.append("retailer demand_signals (<90d) absent")
+        result["composite_note"] = f"Insufficient data to compute composite: {', '.join(missing)}."
+    return result
+
+
+def _crude_demand_analogs(db: Session) -> list[str]:
+    """Historical periods (from eia_daily) where Brent ran elevated — context for the
+    operator. Descriptive only; sourced from our own crude history."""
+    rows = db.execute(text("""
+        SELECT strftime('%Y', as_of_date) AS yr,
+               AVG(CAST(brent_spot AS REAL)) AS avg_brent,
+               MAX(CAST(brent_spot AS REAL)) AS max_brent
+        FROM crude_oil
+        WHERE source = 'eia_daily' AND brent_spot IS NOT NULL
+        GROUP BY strftime('%Y', as_of_date)
+        HAVING AVG(CAST(brent_spot AS REAL)) >= 100
+        ORDER BY avg_brent DESC LIMIT 5
+    """)).fetchall()
+    return [
+        f"{yr}: Brent avg ${avg:.0f}/bbl (peak ${mx:.0f}) — elevated crude environment."
+        for yr, avg, mx in rows
+    ]
+
+
+def get_bunker_fuel_snapshot(db: Session) -> dict:
+    """Marine fuel (crude→freight transmission variable) + the measured
+    crude→bunker relationship. VLSFO is what links Brent to freight surcharges;
+    until a real VLSFO feed is connected we use the EIA distillate proxy and the
+    crude_to_bunker_fuel calibration fitted on decades of data."""
+    grades = ("No2_heating_oil", "ULSD")
+    latest: dict[str, dict] = {}
+    for grade in grades:
+        row = (
+            db.query(BunkerFuelPrices)
+            .filter(BunkerFuelPrices.grade == grade, BunkerFuelPrices.is_latest.is_(True))
+            .order_by(desc(BunkerFuelPrices.as_of_date))
+            .first()
+        )
+        if row:
+            latest[grade] = {
+                "price_usd": float(row.price_usd),
+                "price_unit": row.price_unit,
+                "port": row.port,
+                "as_of_date": row.as_of_date.isoformat(),
+                "is_proxy": bool(row.is_proxy),
+                "proxy_basis": row.proxy_basis,
+            }
+    if not latest:
+        return {
+            "data_available": False,
+            "gaps": ["No bunker fuel data — run: python -m data.ingestion.bunker_fuel_ingestion --backfill"],
+        }
+
+    # cost_component='freight_energy_surcharge' is the Brent→distillate fit
+    # (dist_usd_bbl = 1.163×brent + 5.49, R²=0.88, n=1043, 2006-2026).
+    cal = db.execute(text(
+        "SELECT cost_component, lag_weeks_empirical, transmission_coeff, r_squared, "
+        "obs_count, notes FROM crude_transmission_calibration "
+        "WHERE cost_component = 'freight_energy_surcharge' AND is_active = 1 "
+        "LIMIT 1"
+    )).fetchone()
+
+    brent_row = (
+        db.query(CrudeOil)
+        .filter(CrudeOil.brent_spot.isnot(None), CrudeOil.is_latest.is_(True))
+        .order_by(desc(CrudeOil.as_of_date))
+        .first()
+    )
+    brent = float(brent_row.brent_spot) if brent_row else None
+
+    transmission = None
+    if cal is not None and brent is not None:
+        coeff = float(cal.transmission_coeff)      # $/bbl distillate per $/bbl Brent
+        intercept = 5.49                           # fitted intercept (USD/bbl)
+        implied_dist_bbl = coeff * brent + intercept
+        implied_dist_gal = implied_dist_bbl / 42.0
+
+        # VLSFO ≈ distillate proxy × 1.15 (IMO-2020 spread premium, order-of-magnitude)
+        # Flagged as estimate — real VLSFO calibration requires Ship&Bunker/paid feed.
+        vlsfo_est_gal = implied_dist_gal * 1.15
+
+        delta10_bbl = coeff * 10.0                # $/bbl distillate shift per $10/bbl Brent
+        delta10_gal = delta10_bbl / 42.0
+
+        transmission = {
+            "brent_to_distillate_coeff_bbl_per_bbl": round(coeff, 5),
+            "lag_weeks": float(cal.lag_weeks_empirical),
+            "r_squared": float(cal.r_squared),
+            "obs_count": int(cal.obs_count),
+            "implied_distillate_usd_bbl": round(implied_dist_bbl, 2),
+            "implied_distillate_usd_gal": round(implied_dist_gal, 4),
+            "vlsfo_estimate_usd_gal": round(vlsfo_est_gal, 4),
+            "vlsfo_estimate_basis": "distillate_proxy × 1.15 (IMO-2020 spread premium estimate)",
+            "interpretation": (
+                f"At Brent ${brent:.2f}/bbl: implied distillate "
+                f"${implied_dist_bbl:.2f}/bbl (${implied_dist_gal:.4f}/gal), "
+                f"VLSFO proxy ~${vlsfo_est_gal:.4f}/gal. "
+                f"A $10/bbl Brent move → ${delta10_bbl:.2f}/bbl (${delta10_gal:.4f}/gal) distillate shift. "
+                f"R²={float(cal.r_squared):.2f}, n={int(cal.obs_count)} weekly obs 2006–2026. "
+                "Bunker→container-rate pass-through deferred — awaiting paid WCI/FBX history."
+            ),
+        }
+
+    return {
+        "data_available": True,
+        "latest_proxy_prices": latest,
+        "current_brent_usd_bbl": brent,
+        "crude_to_bunker_transmission": transmission,
+        "note": (
+            "EIA distillate proxy for VLSFO marine fuel (is_proxy=True). "
+            "Real VLSFO assessments arrive with paid Ship&Bunker/Platts/Argus feed. "
+            "Bunker→freight pass-through requires paid Drewry/FBX rate history."
+        ),
+        "gaps": [] if transmission else ["crude→bunker calibration not loaded — check freight_energy_surcharge row"],
     }
 
 
@@ -578,20 +1043,12 @@ def get_freight_snapshot(db: Session) -> dict:
             "war_risk_corridors": [],
         }
 
-    latest = (
+    # One is_latest row per (origin_port, destination_port) corridor.
+    latest_rows = (
         db.query(OceanFreightRates)
         .filter(OceanFreightRates.is_latest.is_(True))
         .order_by(desc(OceanFreightRates.as_of_date))
-        .first()
-    )
-    prior = (
-        db.query(OceanFreightRates)
-        .filter(
-            OceanFreightRates.is_latest.is_(True),
-            OceanFreightRates.as_of_date <= latest.as_of_date - timedelta(days=28),
-        )
-        .order_by(desc(OceanFreightRates.as_of_date))
-        .first()
+        .all()
     )
 
     insurance_rows = (
@@ -621,49 +1078,117 @@ def get_freight_snapshot(db: Session) -> dict:
     ]
 
     corridors: dict[str, dict] = {}
-    for key, (field, corridor_name) in FREIGHT_CORRIDORS.items():
-        rate = float(getattr(latest, field))
+    skipped_no_rate: list[str] = []
+    wci_composite_usd = None
+    wci_composite_as_of = None
+    for r in latest_rows:
+        corridor_label = f"{r.origin_port} → {r.destination_port}"
+        # 40ft high-cube is the WCI publication unit; fall back to 40ft standard.
+        rate_dec = r.rate_40ft_hc_usd if r.rate_40ft_hc_usd is not None else r.rate_40ft_usd
+        if rate_dec is None:
+            # Honest gap — no usable container rate. Never fabricate one.
+            skipped_no_rate.append(corridor_label)
+            continue
+        rate = float(rate_dec)
+        # The WCI global composite is a benchmark index, not a shippable
+        # port-pair — keep it out of per-corridor landed-cost math, expose
+        # it separately as the headline freight series.
+        if r.rate_source_tier == "drewry_wci_composite":
+            wci_composite_usd = rate
+            wci_composite_as_of = r.as_of_date.isoformat()
+            continue
+        key = f"{r.origin_port}_{r.destination_port}".lower().replace(" ", "_")
         per_doz = rate / DOZENS_PER_CONTAINER
-        ins = ins_by_corridor.get(corridor_name.lower())
+
+        # Insurance and geo premium key off origin country / corridor names.
+        ins = ins_by_corridor.get((r.origin_country or "").lower())
         ins_doz = 0.0
         geo_premium_doz = 0.0
         if ins:
             cif = CIF_ASSUMPTION_USD * DOZENS_PER_CONTAINER
             ins_doz = float(ins.total_effective_rate_pct_cif) / 100 * cif / DOZENS_PER_CONTAINER
         for d in disruptions:
-            if corridor_name in d["corridors_affected"] or corridor_name in str(
-                d["corridors_affected"]
+            affected = d["corridors_affected"]
+            if any(
+                tok and (tok in (r.origin_country or "") or tok in r.origin_port
+                         or tok in r.destination_port)
+                for tok in (t.strip() for t in affected)
             ):
                 geo_premium_doz += per_doz * d["freight_impact_pct"] / 100
 
+        # Trend vs ~28 days prior for THIS corridor. History rows carry
+        # is_latest=False, so do not filter on it here.
+        prior = (
+            db.query(OceanFreightRates)
+            .filter(
+                OceanFreightRates.origin_port == r.origin_port,
+                OceanFreightRates.destination_port == r.destination_port,
+                OceanFreightRates.as_of_date <= r.as_of_date - timedelta(days=28),
+                OceanFreightRates.rate_40ft_hc_usd.isnot(None),
+            )
+            .order_by(desc(OceanFreightRates.as_of_date))
+            .first()
+        )
         trend_pct = None
-        if prior:
-            prev = float(getattr(prior, field))
+        if prior and prior.rate_40ft_hc_usd:
+            prev = float(prior.rate_40ft_hc_usd)
             trend_pct = (rate - prev) / prev * 100 if prev else None
 
         corridors[key] = {
+            "origin_port": r.origin_port,
+            "destination_port": r.destination_port,
+            "origin_country": r.origin_country,
             "container_rate_usd": rate,
+            "rate_unit": "40ft high-cube" if r.rate_40ft_hc_usd is not None else "40ft standard",
             "per_dozen_usd": round(per_doz, 4),
             "insurance_per_dozen_usd": round(ins_doz, 4),
             "geopolitical_premium_per_dozen": round(geo_premium_doz, 4),
             "total_freight_insurance_per_dozen": round(
                 per_doz + ins_doz + geo_premium_doz, 4
             ),
-            "transit_days": latest.transit_days,
-            "vessel_availability": latest.status,
+            "transit_days": r.transit_days,
+            "vessel_availability": r.vessel_availability,
+            "source": r.source,
+            "rate_source_tier": r.rate_source_tier,
+            "as_of_date": r.as_of_date.isoformat(),
             "4wk_trend_pct": trend_pct,
         }
 
-    freshness = _days_old(latest.as_of_date)
+    if not corridors and wci_composite_usd is None:
+        return {
+            "data_available": False,
+            "data_unavailable_reason": (
+                "ocean_freight_rates has is_latest rows but none carry a usable 40ft "
+                f"container rate (skipped: {', '.join(skipped_no_rate) or 'all'}). "
+                "Freight excluded from estimates until real rates are present."
+            ),
+            "quality_score": 0.0,
+            "active_disruptions": disruptions,
+            "war_risk_corridors": war_corridors,
+        }
+
+    most_recent = max(r.as_of_date for r in latest_rows)
+    freshness = _days_old(most_recent)
+    gaps = []
+    if skipped_no_rate:
+        gaps.append(
+            f"{len(skipped_no_rate)} corridor(s) had no usable rate and were excluded: "
+            + ", ".join(skipped_no_rate)
+        )
     return {
         "data_available": True,
         "data_unavailable_reason": None,
-        "as_of_date": latest.as_of_date.isoformat(),
+        "as_of_date": most_recent.isoformat(),
         "freshness_days": freshness,
+        "corridor_count": len(corridors),
         "corridors": corridors,
+        "wci_composite_usd": wci_composite_usd,
+        "wci_composite_as_of": wci_composite_as_of,
+        "bunker_fuel": get_bunker_fuel_snapshot(db),
         "active_disruptions": disruptions,
         "war_risk_corridors": war_corridors,
         "quality_score": round(_quality_from_freshness(freshness, 14, 0.85), 3),
+        "gaps": gaps,
     }
 
 
@@ -1119,9 +1644,13 @@ Geopolitical chemical premium active: {crude.get('geopolitical_chemical_premium'
 
 --- OCEAN FREIGHT ---
 Data available: {freight.get('data_available')}
+WCI global composite (40HQ): {("$" + format(freight['wci_composite_usd'], ',.0f') + " as of " + str(freight.get('wci_composite_as_of'))) if freight.get('wci_composite_usd') else "not parsed this week"}
 {"⚠ " + freight.get('data_unavailable_reason', '') if not freight.get('data_available') else json.dumps(freight.get('corridors', {}), indent=2, default=str)}
 Active disruptions: {json.dumps(freight.get('active_disruptions', []), indent=2)}
 War risk surcharges active on: {freight.get('war_risk_corridors', [])}
+
+Bunker fuel & crude→freight transmission:
+{json.dumps(freight.get('bunker_fuel', {}), indent=2, default=str)}
 
 --- GEOPOLITICAL ---
 {json.dumps(geo, indent=2, default=str)}
@@ -1396,6 +1925,161 @@ REQUIRED STRUCTURE:
         "quote_analysis": quote_analysis,
         "generated_at": datetime.utcnow().isoformat(),
         "tokens_used": response.usage.input_tokens + response.usage.output_tokens,
+    }
+
+
+def write_crude_hedge_recommendations(db: Session) -> dict:
+    """
+    Write hedge_opportunity_recommendation rows for open programs based on crude market structure.
+
+    Logic:
+    - If crude_market_structure == 'contango': create/update CONSIDER_HEDGE rows for all open
+      programs with delivery_date > today + 30 days. Idempotent: skip if a row already exists
+      for this program + commodity='crude_brent' + as_of_date=today.
+    - If crude_market_structure == 'backwardation': note existing open rows (do not create new).
+
+    Model version: 1.0.0 until empirical transmission coefficient is activated.
+    Confidence: 0.55 — low, pending calibration from RRK invoice data.
+
+    Returns summary dict with counts of inserted, skipped, and noted rows.
+    """
+    today = date.today()
+    min_delivery = today + timedelta(days=30)
+    MODEL_VERSION = "1.0.0"
+    CONFIDENCE = Decimal("0.55")
+
+    # Get market structure from CrudeCostInputs
+    try:
+        crude_inputs = CrudeCostInputs(db)
+        forward = crude_inputs.get_forward_input(
+            delivery_date=today + timedelta(days=90),
+            as_of_date=today,
+        )
+        market_structure = forward.get("market_structure")
+        brent_futures_3m = forward.get("brent_futures")
+        spot = crude_inputs.get_spot_input(today)
+        brent_t4w = spot.get("brent_t4w")
+    except CrudeDataStaleError as exc:
+        logger.warning(f"write_crude_hedge_recommendations: crude data stale: {exc}")
+        return {"inserted": 0, "skipped": 0, "noted": 0, "error": str(exc)}
+
+    if market_structure is None:
+        return {"inserted": 0, "skipped": 0, "noted": 0, "error": "market_structure unavailable"}
+
+    # Fetch open programs with upcoming delivery
+    try:
+        open_programs = (
+            db.query(Program)
+            .filter(
+                Program.delivery_date_committed > min_delivery,
+                Program.status.in_(["active", "in_production", "confirmed", "open"]),
+            )
+            .all()
+        )
+    except Exception as exc:
+        logger.warning(f"write_crude_hedge_recommendations: program query failed: {exc}")
+        open_programs = []
+
+    inserted = skipped = noted = 0
+
+    for program in open_programs:
+        delivery = program.delivery_date_committed
+        if delivery is None:
+            continue
+
+        days_to_delivery = (delivery - today).days
+        if days_to_delivery <= 30:
+            tenor_months = 1
+        elif days_to_delivery <= 90:
+            tenor_months = 3
+        elif days_to_delivery <= 180:
+            tenor_months = 6
+        else:
+            tenor_months = 12
+
+        if market_structure == "contango":
+            # Idempotency: skip if row already exists for today
+            existing = (
+                db.query(HedgeOpportunityRecommendation)
+                .filter_by(
+                    program_id=program.program_id,
+                    commodity="crude_brent",
+                    as_of_date=today,
+                )
+                .first()
+            )
+            if existing:
+                skipped += 1
+                continue
+
+            # potential_saving_doz: $0.003/dozen per $1 of crude contango
+            # placeholder until empirical transmission coefficient is activated
+            crude_spread = (
+                float(brent_futures_3m) - float(brent_t4w)
+                if brent_futures_3m is not None and brent_t4w is not None
+                else 0.0
+            )
+            potential_saving_doz = Decimal(str(round(max(0.0, crude_spread * 0.003), 4)))
+
+            qty_dozens = Decimal(str(program.quantity_units or 0)) / Decimal("12")
+            risk_if_unhedged = potential_saving_doz * qty_dozens
+
+            rec = HedgeOpportunityRecommendation(
+                program_id=program.program_id,
+                commodity="crude_brent",
+                tenor_months=tenor_months,
+                recommended_action=(
+                    "CONSIDER_HEDGE — crude in contango, input costs rising. "
+                    f"Brent futures 3m=${float(brent_futures_3m):.2f}/bbl vs "
+                    f"current ${float(brent_t4w):.2f}/bbl."
+                    if brent_futures_3m is not None and brent_t4w is not None
+                    else "CONSIDER_HEDGE — crude in contango, forward curve elevated."
+                ),
+                potential_saving_doz=potential_saving_doz,
+                risk_if_unhedged=risk_if_unhedged.quantize(Decimal("0.01")),
+                confidence_score=CONFIDENCE,
+                as_of_date=today,
+                model_version=MODEL_VERSION,
+            )
+            db.add(rec)
+            inserted += 1
+
+        elif market_structure == "backwardation":
+            # Note existing open crude hedge rows — backwardation = no urgency to hedge
+            existing_rows = (
+                db.query(HedgeOpportunityRecommendation)
+                .filter_by(
+                    program_id=program.program_id,
+                    commodity="crude_brent",
+                )
+                .filter(HedgeOpportunityRecommendation.recommended_action.like("CONSIDER_HEDGE%"))
+                .all()
+            )
+            for row in existing_rows:
+                row.recommended_action = (
+                    row.recommended_action
+                    + f" | NOTE {today}: crude_cost_pressure_easing — "
+                    "market in backwardation, monitor for opportunistic unhedge."
+                )
+                noted += 1
+
+    try:
+        db.commit()
+        logger.info(
+            f"write_crude_hedge_recommendations: structure={market_structure}, "
+            f"inserted={inserted}, skipped={skipped}, noted={noted}"
+        )
+    except Exception as exc:
+        db.rollback()
+        logger.error(f"write_crude_hedge_recommendations: commit failed: {exc}")
+        return {"inserted": 0, "skipped": 0, "noted": 0, "error": str(exc)}
+
+    return {
+        "market_structure": market_structure,
+        "programs_evaluated": len(open_programs),
+        "inserted": inserted,
+        "skipped": skipped,
+        "noted": noted,
     }
 
 

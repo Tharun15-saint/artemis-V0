@@ -1,5 +1,10 @@
 """
-Diagnostic: test Freightos FBX API endpoints and inspect response shape.
+Diagnostic / Stage-2 adapter stub: test Freightos FBX API endpoints and inspect
+response shape. This is the entry point for the PAID per-lane freight feed
+described in docs/OCEAN_FREIGHT_ARCHITECTURE.md (Stage 2). The FBX API is paid
+(Freightos "Full Platform" tier) — this script is inert until a key + endpoint
+contract is confirmed, at which point it graduates into a full ingestion writing
+fbx_lane_direct rows to ocean_freight_rates.
 
 Reads FREIGHTOS_API_KEY from the environment — never hardcode keys.
 """

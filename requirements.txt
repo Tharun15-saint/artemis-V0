@@ -1,5 +1,6 @@
 alembic==1.13.1
 annotated-doc==0.0.4
+psycopg[binary]==3.2.13
 annotated-types==0.7.0
 anthropic==0.28.0
 anyio==4.12.1
@@ -84,3 +85,4 @@ watchfiles==1.1.1
 webencodings==0.5.1
 websockets==15.0.1
 yfinance==0.2.40
+holidays==0.83

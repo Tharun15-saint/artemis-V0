@@ -1,0 +1,15 @@
+{
+  "run_date": "2026-06-16",
+  "funnel": {
+    "total": 0,
+    "with_date": 0,
+    "with_cost": 0,
+    "high_conf": 0
+  },
+  "n_raw_pairs": 0,
+  "status": "PENDING",
+  "activated": false,
+  "extraction_yield_pct": 0.0,
+  "pairs_needed": 20,
+  "reason": "0/20 validated pairs. 20 more required."
+}

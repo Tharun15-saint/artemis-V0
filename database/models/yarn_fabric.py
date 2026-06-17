@@ -49,7 +49,7 @@ class Yarn(Base):
     cotton_price_source          = Column(String(50))
     global_cotton_benchmark_usd_kg = Column(Numeric(10, 4))
     global_cotton_benchmark_inr_kg = Column(Numeric(10, 4))
-    global_cotton_benchmark_source = Column(String(100))
+    global_cotton_benchmark_source = Column(String(255))
     global_cotton_benchmark_date = Column(Date)
     spinning_premium_inr_kg      = Column(Numeric(10, 4))
     spinning_premium_usd_kg      = Column(Numeric(10, 4))
@@ -59,6 +59,15 @@ class Yarn(Base):
     data_notes                   = Column(Text)
     pulled_at                    = Column(DateTime, nullable=False, server_default=func.now())
     is_latest                    = Column(Boolean, nullable=False, default=True, server_default="1")
+    # World 1 additions — product identity fields missing from original schema
+    colour_state                 = Column(String(50))   # greige | yarn_dyed | solution_dyed
+    # greige = requires fabric dyeing; yarn_dyed/solution_dyed = FabricDyeing.bypassed=True
+    dyeing_step_required         = Column(Boolean)      # derived: True when colour_state='greige'
+    # tirupur spot rate on GRN date — enables premium = (po_rate_inr / market_rate_inr) - 1
+    tirupur_market_rate_inr_kg   = Column(Numeric(10, 4))
+    # expected GSM output range for this yarn (for FabricKnitting target validation)
+    expected_gsm_min             = Column(Numeric(8, 2))
+    expected_gsm_max             = Column(Numeric(8, 2))
     created_at                   = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at                   = Column(DateTime, server_default=func.now(),
                                          onupdate=func.now(), nullable=False)

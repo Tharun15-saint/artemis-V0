@@ -290,6 +290,7 @@ def append_crude_row(
             wti_spot=wti,
             as_of_date=as_of,
             days_since_refresh=_days_since_refresh(as_of),
+            aggregation_period="monthly",
             source=SOURCE_NAME,
             data_source_url=WB_PINK_SHEET_URL,
             refresh="monthly",

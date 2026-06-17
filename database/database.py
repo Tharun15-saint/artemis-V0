@@ -1,38 +1,36 @@
-import os
-from collections.abc import Generator
+"""Backwards-compatible database entrypoint.
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+Historically this module defined its OWN engine, SessionLocal and Base, separate
+from database/base.py. That created two distinct DeclarativeBase classes and two
+engines — a latent correctness bug. This module now re-exports the single
+canonical objects from database.base so that every import path
+(`from database.database import ...` and `from database.base import ...`)
+resolves to the exact same engine, session factory and metadata.
+"""
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "sqlite:///./artemis.db",
-)
-
-engine = create_engine(
+from database.base import (  # noqa: F401
+    Base,
     DATABASE_URL,
-    pool_size=5,
-    max_overflow=10,
-    pool_timeout=30,
-    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+    IS_SQLITE,
+    SessionLocal,
+    engine,
+    get_db,
 )
-
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-
-class Base(DeclarativeBase):
-    pass
-
-
-def get_db() -> Generator[Session, None, None]:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 def init_db() -> None:
-    from database import models  # noqa: F401
+    """Create all tables on the configured database from the ORM metadata."""
+    import database.models  # noqa: F401 — registers every model on Base.metadata
 
     Base.metadata.create_all(bind=engine)
+
+
+__all__ = [
+    "Base",
+    "DATABASE_URL",
+    "IS_SQLITE",
+    "SessionLocal",
+    "engine",
+    "get_db",
+    "init_db",
+]

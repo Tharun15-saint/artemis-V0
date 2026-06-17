@@ -17,7 +17,7 @@ class CurrentLandedCostPerDozen(Base):
     variance_pct         = Column(Numeric(6, 2))
     data_quality_score   = Column(Numeric(5, 2))
     as_of_date           = Column(Date)
-    model_version        = Column(String(20), nullable=False, server_default="1.0.0")
+    model_version        = Column(String(64), nullable=False, server_default="1.0.0")
     created_at           = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at           = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -32,7 +32,7 @@ class ForwardLandedCost90Day(Base):
     p90                  = Column(Numeric(10, 4))
     dominant_risk_factor = Column(String(255))
     as_of_date           = Column(Date)
-    model_version        = Column(String(20), nullable=False, server_default="1.0.0")
+    model_version        = Column(String(64), nullable=False, server_default="1.0.0")
     created_at           = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at           = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -112,7 +112,7 @@ class RetailerDemandForecast(Base):
     as_of_date           = Column(Date)
     fiscal_year_latest   = Column(Integer)
     fiscal_quarter_latest = Column(Integer)
-    model_version        = Column(String(20), nullable=False, server_default="1.0.0")
+    model_version        = Column(String(64), nullable=False, server_default="1.0.0")
     metadata_json        = Column(Text)
     created_at           = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at           = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -193,7 +193,7 @@ class FreightBookingWindow(Base):
     rate_trend           = Column(String(50))
     urgency              = Column(String(50))
     as_of_date           = Column(Date)
-    model_version        = Column(String(20), nullable=False, server_default="1.0.0")
+    model_version        = Column(String(64), nullable=False, server_default="1.0.0")
     created_at           = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at           = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 

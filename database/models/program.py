@@ -16,6 +16,12 @@ class ProductSpecification(Base):
     prototype_corridor_1    = Column(String(100))
     prototype_corridor_2    = Column(String(100))
     prototype_corridor_3    = Column(String(100))
+    # World 1 additions — connect to the new product chain
+    construction_id         = Column(Integer)   # FK → garment_construction (when spec matures to full build)
+    silhouette              = Column(String(50))
+    # crew_neck_tee | v_neck_tee | polo | hoodie_pullover | hoodie_zip | sweatshirt | jogger | shorts
+    complexity_score        = Column(Integer)   # 1-10 (drives CMT cost via learned_coefficient)
+    piece_weight_grams_typical = Column(Numeric(8, 2))  # typical piece weight for this product type
     created_at              = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at              = Column(DateTime, server_default=func.now(),
                                      onupdate=func.now(), nullable=False)
@@ -46,6 +52,17 @@ class Program(Base):
     otd_risk_score          = Column(Numeric(5, 2))
     landed_cost_estimated   = Column(Numeric(10, 4))
     landed_cost_actual      = Column(Numeric(10, 4))  # Set only after duty confirmed
+    # World 2/3 additions — richer commercial context
+    construction_id         = Column(Integer)   # FK → garment_construction
+    retailer_id             = Column(Integer)   # FK → major_retailers (end customer)
+    program_ref             = Column(String(100))   # buyer's internal reference e.g. "CF-AW24-001"
+    season_year             = Column(Integer)       # 2024, 2025, …
+    season_type             = Column(String(50))    # spring_summer | fall_winter | cruise | resort
+    agreed_fob_per_unit_usd = Column(Numeric(10, 4))   # commercial FOB per unit (taxonomy primary field)
+    sourcing_type           = Column(String(50))
+    # full_package | cmt_only | nominated_fabric | nominated_yarn
+    payment_terms           = Column(String(50))
+    # lc_at_sight | lc_90 | tt_advance | open_account_30 | open_account_60 | open_account_90 | da_60 | da_90
     created_at              = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at              = Column(DateTime, server_default=func.now(),
                                      onupdate=func.now(), nullable=False)

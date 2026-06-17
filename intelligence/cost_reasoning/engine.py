@@ -22,10 +22,12 @@ from database.models import (
     CostVariablePrior,
     Cotton,
     CottonSupplyDemand,
-    CrudeOil,
     DiscoveredCostFactor,
     PurchaseOrderHistory,
 )
+from intelligence.crude_cost_inputs import CrudeCostInputs
+from intelligence.exceptions import CrudeDataStaleError, CrudeQualityBlockError
+from data.ingestion.crude_oil_quality_checks import get_blocking_failures
 from intelligence.cost_reasoning.types import (
     CostReasoningResult,
     LayerEstimate,
@@ -503,16 +505,46 @@ class CostReasoningEngine:
         else:
             data["cotton_market"] = "neutral"
 
-        crude = (
-            self.db.query(CrudeOil)
-            .filter(CrudeOil.is_latest.is_(True))
-            .order_by(desc(CrudeOil.as_of_date))
-            .first()
-        )
-        if crude and crude.wti_spot is not None:
-            wti = float(crude.wti_spot)
-            data["crude_wti"] = wti
-            data["crude_oil"] = "elevated" if wti > 75 else "normal"
+        # BLOCKING GATE — abort if unresolved quality failures exist
+        blocking = get_blocking_failures(self.db)
+        if blocking:
+            raise CrudeQualityBlockError(
+                f"Crude quality gate: unresolved failures in quality_check_log: {blocking}. "
+                "Resolve and mark resolved=True before running cost estimates."
+            )
+
+        # All crude data flows through CrudeCostInputs — no direct crude_oil table access.
+        try:
+            from database.constants import CRUDE_OIL_LEVEL_THRESHOLDS
+            crude_inputs = CrudeCostInputs(self.db)
+            spot = crude_inputs.get_spot_input(date.today())
+            dyeing = crude_inputs.get_dyeing_pressure(date.today())
+
+            brent = float(spot["brent_rolling_avg"]) if spot["brent_rolling_avg"] is not None else None
+            if brent is not None:
+                # Use Brent rolling avg as the level signal — smoothed, avoids single-day spikes.
+                data["crude_brent"] = brent
+                data["crude_brent_t4w"] = float(spot["brent_t4w"]) if spot["brent_t4w"] is not None else None
+                if brent >= float(CRUDE_OIL_LEVEL_THRESHOLDS["high"]):
+                    data["crude_oil"] = "high"
+                elif brent >= float(CRUDE_OIL_LEVEL_THRESHOLDS["elevated"]):
+                    data["crude_oil"] = "elevated"
+                elif brent >= float(CRUDE_OIL_LEVEL_THRESHOLDS["normal"]):
+                    data["crude_oil"] = "normal"
+                else:
+                    data["crude_oil"] = "low"
+            data["dyeing_premium_active"] = spot["dyeing_premium_active"]
+            data["dyeing_premium_tier"] = dyeing["dyeing_premium_tier"]
+
+            # CRUDE_LINKAGE_PENDING step 7 — energy overhead multiplier
+            # Requires RRK energy invoice calibration (n=0). No approximation applied.
+
+            # CRUDE_LINKAGE_PENDING step 11 — ocean freight bunker surcharge
+            # Requires Drewry WCI live data. No approximation applied.
+
+        except CrudeDataStaleError as exc:
+            logger.warning(f"Crude data stale — cost estimate proceeds without crude signals: {exc}")
+            data["crude_oil"] = None
 
         return data
 
@@ -546,7 +578,13 @@ class CostReasoningEngine:
         if name == "colour_tier" and spec.colour_tier:
             return spec.colour_tier == value
         if name == "crude_oil":
-            return market.get("crude_oil") == value
+            crude_level = market.get("crude_oil")
+            # "elevated" CostVariablePrior records must fire at BOTH "elevated" and "high" levels.
+            # Without this, a $105/bbl Brent market (crude_oil="high") silently misses all
+            # "elevated" priors — the cost adjustment doesn't apply at the moment it matters most.
+            if value == "elevated":
+                return crude_level in ("elevated", "high")
+            return crude_level == value
         if name == "style_complexity" and spec.style_complexity:
             return spec.style_complexity == value
         if name == "construction" and spec.construction:
@@ -655,6 +693,12 @@ class CostReasoningEngine:
                 if factor.layer_name == layer.layer_name or factor.layer_name == "unknown":
                     low, high, label = self._apply_discovered_factor(low, high, factor)
                     factors.append(f"discovered:{label}")
+
+            # CRUDE_LINKAGE_PENDING step 7 — energy overhead multiplier
+            # Will apply crude × energy transmission coefficient once RRK invoices are calibrated.
+
+            # CRUDE_LINKAGE_PENDING step 11 — ocean freight bunker surcharge
+            # Will apply crude × Drewry WCI freight transmission once live data is integrated.
 
             mid = (low + high) / 2
             conf = 0.72 if factors else 0.65

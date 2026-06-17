@@ -20,7 +20,7 @@ class IngestionLog(Base):
     data_source_url     = Column(String(500), nullable=True)
     error_message       = Column(Text, nullable=True)
     validation_failures = Column(Text, nullable=True)
-    script_version      = Column(String(20), nullable=True)
+    script_version      = Column(String(64), nullable=True)
     created_at          = Column(DateTime, server_default=func.now())
     updated_at          = Column(
         DateTime,

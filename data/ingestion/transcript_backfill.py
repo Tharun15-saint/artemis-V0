@@ -383,6 +383,13 @@ _FOOL_ANALYST_INTRO_RE = re.compile(
     r"([A-Z][\w\.\'\-]+(?:\s+[A-Z][\w\.\'\-]+)*)\s+with\b",
     re.I,
 )
+# Motley Fool primary format: "Name -- Title" on its own line
+# e.g. "Brian Cornell -- Chairman and Chief Executive Officer"
+_FOOL_SPEAKER_DASH_RE = re.compile(
+    r"^\s*([A-Z][\w\.\'\-]+(?:\s+[A-Z][\w\.\'\-]+){0,4})\s+--\s+(.+)$",
+    re.M,
+)
+# Fallback: inline "Name:" after sentence punctuation (older Fool format)
 _FOOL_SPEAKER_COLON_RE = re.compile(
     r"(?<=[.!?])\s+([A-Z][\w\.\'\-]+(?:\s+[A-Z][\w\.\'\-]+){0,3}):"
 )
@@ -391,6 +398,9 @@ _FOOL_QA_START_RE = re.compile(
     r"we(?:'|&#x27;)ll open the line for questions)",
     re.I,
 )
+# Title keywords that unambiguously identify CEO/CFO from Motley Fool title strings
+_CEO_TITLE_RE = re.compile(r"chief\s+executive|president\s+and\s+ceo|\bceo\b", re.I)
+_CFO_TITLE_RE = re.compile(r"chief\s+financial|\bcfo\b", re.I)
 
 
 def _extract_fool_transcript_text(page_html: str) -> Optional[str]:
@@ -424,8 +434,27 @@ def _extract_fool_transcript_text(page_html: str) -> Optional[str]:
     return None
 
 
+def _fool_role_from_title(name: str, title: str, analyst_names: set[str]) -> str:
+    """Derive role label from Motley Fool's 'Name -- Title' header."""
+    if name.lower() == "operator":
+        return "Operator"
+    if name in analyst_names:
+        return "Analyst"
+    if _CEO_TITLE_RE.search(title):
+        return "Chief Executive Officer"
+    if _CFO_TITLE_RE.search(title):
+        return "Chief Financial Officer"
+    # Preserve enough title for _classify_role to detect seniority downstream
+    return title.strip()[:80]
+
+
 def _normalize_fool_transcript_text(text: str) -> str:
-    """Adapt Motley Fool inline transcript formatting for the passage parser."""
+    """Adapt Motley Fool transcript formatting for the passage parser.
+
+    Handles both formats:
+    - Primary (current): 'Name -- Title' on its own line
+    - Legacy: 'Name:' inline after sentence punctuation
+    """
     normalized = html.unescape(text)
     normalized = normalized.replace("&#x27;", "'").replace("&#39;", "'")
 
@@ -442,15 +471,30 @@ def _normalize_fool_transcript_text(text: str) -> str:
             f"{normalized[qa_start.start() :].lstrip()}"
         )
 
-    def _speaker_replacement(match: re.Match[str]) -> str:
+    # Primary format: "Brian Cornell -- Chairman and Chief Executive Officer"
+    def _dash_replacement(match: re.Match[str]) -> str:
         name = match.group(1).strip()
+        title = match.group(2).strip()
         if name.lower() == "operator":
             return "\n\nOperator\n"
-        if name in analyst_names:
-            return f"\n\n{name} - Analyst\n"
-        return f"\n\n{name} - Management\n"
+        role = _fool_role_from_title(name, title, analyst_names)
+        return f"\n\n{name} - {role}\n"
 
-    normalized = _FOOL_SPEAKER_COLON_RE.sub(_speaker_replacement, normalized)
+    dash_count = len(_FOOL_SPEAKER_DASH_RE.findall(normalized))
+    if dash_count > 0:
+        normalized = _FOOL_SPEAKER_DASH_RE.sub(_dash_replacement, normalized)
+    else:
+        # Legacy inline "Name:" format
+        def _colon_replacement(match: re.Match[str]) -> str:
+            name = match.group(1).strip()
+            if name.lower() == "operator":
+                return "\n\nOperator\n"
+            if name in analyst_names:
+                return f"\n\n{name} - Analyst\n"
+            return f"\n\n{name} - Management\n"
+
+        normalized = _FOOL_SPEAKER_COLON_RE.sub(_colon_replacement, normalized)
+
     normalized = re.sub(
         r"^Operator:\s*",
         "Operator\n",

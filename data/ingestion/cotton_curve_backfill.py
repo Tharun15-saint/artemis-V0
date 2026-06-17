@@ -1,3 +1,12 @@
+raise SystemExit(
+    "\n"
+    "PERMANENTLY DISABLED — cotton_curve_backfill.py\n"
+    "This script generates synthetic S/U-calibrated cotton futures curves.\n"
+    "Synthetic futures data corrupts model training.\n"
+    "Real-data-only policy: use cotton_ice_historical_backfill.py instead.\n"
+    "If you need to re-enable this, you are making a mistake.\n"
+)
+
 import logging
 from datetime import date
 from decimal import Decimal

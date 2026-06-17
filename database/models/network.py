@@ -18,6 +18,16 @@ class Importer(Base):
     discovers_factories         = Column(Boolean)
     account_manager             = Column(String(255))
     joined_date                 = Column(Date)
+    # World 2 deep actor profile — who this importer actually is
+    headquarters_country        = Column(String(100))   # "Jordan" for Classic Fashion
+    headquarters_city           = Column(String(100))   # "Amman"
+    has_own_manufacturing       = Column(Boolean)       # True for Classic Fashion / Athlux Studio
+    own_manufacturing_country   = Column(String(100))   # "Jordan"
+    own_manufacturing_capacity_day = Column(Integer)    # pieces/day of own factories
+    # trade_names: JSON array e.g. ["Classic Fashion", "Athlux Studio"]
+    trade_names_json            = Column(String)
+    primary_buying_hub          = Column(String(100))   # "Tirupur" — primary sourcing cluster
+    buying_relationship_since   = Column(Date)          # date of first purchase order placed
     created_at                  = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at                  = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -36,6 +46,21 @@ class Manufacturer(Base):
     accesses_scf                = Column(Boolean)
     builds_profile              = Column(Boolean)
     joined_date                 = Column(Date)
+    # World 2 deep actor profile — who this manufacturer actually is
+    manufacturing_hub           = Column(String(100))   # "Tirupur" — the geographic cluster
+    established_year            = Column(Integer)       # 1994 for RRK (30+ years)
+    daily_capacity_units        = Column(Integer)       # 200000 for RRK
+    active_production_units     = Column(Integer)       # 5 for RRK
+    # vertical_integration: JSON array e.g. ["knitting", "dyeing", "finishing", "cut_make_trim"]
+    vertical_integration_json   = Column(String)
+    # product_capabilities: JSON dict e.g. {"single_jersey": true, "french_terry": true}
+    product_capabilities_json   = Column(String)
+    # compliance_certificates: JSON array e.g. ["GOTS", "OCS", "Sedex", "BSCI"]
+    compliance_certificates_json = Column(String)
+    # trade_names: JSON array e.g. ["RRK Knit Wear", "RRK Exports", "RRK Textiles"]
+    trade_names_json            = Column(String)
+    # export_markets: JSON array e.g. ["US", "EU", "Canada", "Australia"]
+    export_markets_json         = Column(String)
     created_at                  = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at                  = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -67,3 +92,19 @@ class ImporterWorkingCapital(Base):
     cost_of_carry_per_dozen = Column(Numeric(10, 4))
     created_at              = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at              = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class CompanyFactoryRelationship(Base):
+    """Legacy class — references table from old architecture. Table not yet migrated to current schema."""
+    __tablename__ = "company_factory_relationship"
+    id               = Column(Integer, primary_key=True)
+    company_id       = Column(Integer)
+    factory_name     = Column(String(255))
+    factory_location = Column(String(255))
+    factory_corridor = Column(String(100))
+    relationship_years = Column(Integer)
+    programs_completed = Column(Integer)
+    avg_otd_rate     = Column(Numeric(10, 4))
+    avg_quality_acceptance_rate = Column(Numeric(10, 4))
+    avg_price_vs_market_pct = Column(Numeric(10, 4))
+    typical_payment_terms = Column(String(100))

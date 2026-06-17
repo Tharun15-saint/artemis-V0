@@ -1,17 +1,25 @@
 """
 Ocean freight rate ingestion from Drewry World Container Index (WCI).
 
-Fetches weekly WCI rates from Drewry's public page, derives corridor rates
-for all 19 configured corridors, and writes append-only rows to
-ocean_freight_rates with full provenance tracking.
+Fetches weekly WCI rates from Drewry's public page and writes append-only rows
+to ocean_freight_rates with full provenance tracking.
+
+REAL DATA ONLY. As of the 2026-06 integrity rebuild this script writes ONLY the
+corridors Drewry actually publishes (drewry_wci_direct) plus the WCI global
+composite. It no longer derives non-published corridors by multiplying Shanghai
+rates by a static differential — those derived rows were collinear with the
+Shanghai base and carried zero independent information, so they were purged
+(see ocean_freight_derived_purge.py). Per-lane rates for Asian/Indian-subcontinent
+origins return ONLY via a paid FBX / Drewry feed (see ocean_freight_fbx_diagnostic.py).
 
 Data discipline:
-- Direct Drewry corridors: tagged drewry_wci_direct, no differential
-- Derived corridors: tagged drewry_wci_derived, differential from
-  ocean_freight_corridor_config, base corridor documented
-- Every null field has an explicit reason in data_notes
-- is_latest scoped per (origin_port, destination_port, as_of_date)
-- Every run logged to ingestion_log
+- Only corridors with a REAL parsed rate are written; unparsed ones are skipped
+  with an explicit reason (never fabricated).
+- Identical re-pulls (same corridor + as_of_date + rate) are skipped via
+  is_duplicate_row to avoid same-date duplicate rows.
+- is_latest scoped per (origin_port, destination_port).
+- Every null field has an explicit reason in data_notes.
+- Every run logged to ingestion_log.
 
 Source: https://www.drewry.co.uk/supply-chain-advisors/supply-chain-expertise/world-container-index-assessed-by-drewry
 Update frequency: Weekly, published every Thursday
@@ -30,7 +38,7 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from database.base import SessionLocal, mark_latest
+from database.base import SessionLocal, is_duplicate_row, mark_latest
 from database.ingestion_context import IngestionContext
 from database.models import OceanFreightRates
 
@@ -41,7 +49,14 @@ logging.basicConfig(
 )
 
 SOURCE_NAME = 'ocean_freight_drewry'
-SCRIPT_VERSION = '1.0.0'
+SCRIPT_VERSION = '2.0.0'  # 2026-06 integrity rebuild: real-data-only, no derivation
+DIRECT_TIER = 'drewry_wci_direct'
+COMPOSITE_TIER = 'drewry_wci_composite'
+# The WCI global composite is a benchmark index, not a shippable port-pair.
+# Stored with these sentinel endpoints so consumers can filter it out of
+# per-corridor landed-cost math while still using it as a freight time series.
+COMPOSITE_ORIGIN = 'WCI Composite'
+COMPOSITE_DESTINATION = 'Global Composite'
 DREWRY_URL = (
     'https://www.drewry.co.uk/supply-chain-advisors/supply-chain-expertise/'
     'world-container-index-assessed-by-drewry'
@@ -146,54 +161,26 @@ def _load_corridor_config(db: Session) -> list[dict]:
     return [dict(row._mapping) for row in rows]
 
 
-def _derive_rate(
-    base_rate: Decimal,
-    differential_pct: Optional[float],
-) -> Decimal:
-    """Apply corridor differential to base rate."""
-    if differential_pct is None:
-        return base_rate
-    factor = Decimal(str(1 + differential_pct / 100))
-    return (base_rate * factor).quantize(Decimal('0.01'))
-
-
-def _build_data_notes(
-    corridor: dict,
-    base_rate: Optional[Decimal],
-    as_of_date: date,
-) -> str:
-    """Build structured data_notes JSON for a rate row."""
-    notes = {
-        'source_tier': corridor['source_tier'],
+def _build_data_notes(source_tier: str, as_of_date: date) -> str:
+    """Build structured data_notes JSON for a real Drewry WCI rate row."""
+    return json.dumps({
+        'source_tier': source_tier,
         'as_of_date': as_of_date.isoformat(),
-    }
-    if corridor['source_tier'] == 'drewry_wci_derived':
-        notes['base_corridor'] = corridor['base_drewry_corridor']
-        notes['differential_pct'] = corridor['differential_pct']
-        notes['base_rate_usd'] = str(base_rate) if base_rate else None
-        notes['differential_source'] = corridor['differential_source']
-        notes['null_fields'] = {}
-        if corridor.get('transit_days_estimate'):
-            notes['transit_days_note'] = 'estimated from corridor config, not confirmed booking'
-    else:
-        notes['source_url'] = DREWRY_URL
-        notes['null_fields'] = {}
-
-    # Document expected nulls
-    null_reasons = {
-        'rate_20ft_usd': 'not published by Drewry WCI for this corridor',
-        'vessel_availability': 'qualitative field not in WCI publication',
-        'port_congestion_index': 'only available for major hub ports via separate index',
-    }
-    notes['null_fields'] = null_reasons
-    return json.dumps(notes)
+        'source_url': DREWRY_URL,
+        'null_fields': {
+            'rate_20ft_usd': 'not published by Drewry WCI for this corridor',
+            'rate_40ft_usd': 'WCI publishes 40HQ (high-cube), not standard 40ft',
+            'vessel_availability': 'qualitative field not in WCI publication',
+            'port_congestion_index': 'only available for major hub ports via separate index',
+        },
+    })
 
 
 def ingest_ocean_freight(db: Session, ctx: IngestionContext) -> dict:
     """
-    Main ingestion function. Fetches Drewry WCI, extracts rates,
-    derives all 19 corridor rates, writes to ocean_freight_rates.
-    Returns summary stats.
+    Fetch Drewry WCI, extract the real published corridor rates and the global
+    composite, and write them append-only to ocean_freight_rates. Does not
+    derive non-published corridors. Returns summary stats.
     """
     pulled_at = datetime.now(timezone.utc)
     stats = {'rows_inserted': 0, 'rows_rejected': 0, 'corridors_processed': 0}
@@ -231,96 +218,96 @@ def ingest_ocean_freight(db: Session, ctx: IngestionContext) -> dict:
     else:
         logger.warning('Could not parse WCI composite rate')
 
-    # Load corridor config
+    # Load corridor config and keep ONLY the real Drewry-published corridors.
+    # Derived corridors are intentionally ignored (see module docstring).
     corridors = _load_corridor_config(db)
-    logger.info('Loaded %d active corridors from config', len(corridors))
+    direct_corridors = [c for c in corridors if c['source_tier'] == DIRECT_TIER]
+    logger.info(
+        'Loaded %d active corridors (%d direct/real, ignoring derived)',
+        len(corridors), len(direct_corridors),
+    )
 
-    # Map corridor codes to direct rates for derivation
-    # SHA-LAX uses Shanghai-Los Angeles, SHA-NYC uses Shanghai-New York, etc.
-    drewry_direct_map = {
-        'SHA-LAX': direct_rates.get('Shanghai-Los Angeles'),
-        'SHA-NYC': direct_rates.get('Shanghai-New York'),
-        'RTM-NYC': direct_rates.get('Rotterdam-New York'),
-        'SHA-GEN': direct_rates.get('Shanghai-Genoa'),
-    }
-
-    # Process each corridor
-    for corridor in corridors:
-        corridor_code = corridor['corridor_code']
-        source_tier = corridor['source_tier']
-
-        # Determine the rate for this corridor
-        if source_tier == 'drewry_wci_direct':
-            # Map corridor code to parsed rate
-            rate_40ft = drewry_direct_map.get(corridor_code)
-            base_rate = None
-        else:
-            # Derived corridor — apply differential to base
-            base_corridor_code = corridor['base_drewry_corridor']
-            base_rate = drewry_direct_map.get(base_corridor_code)
-            if base_rate is None:
-                logger.warning(
-                    'Base rate not available for %s (base: %s) — skipping',
-                    corridor_code, base_corridor_code
-                )
-                stats['rows_rejected'] += 1
-                ctx.increment_rejected(
-                    f'Base rate not available for {corridor_code} (base: {base_corridor_code})'
-                )
-                continue
-            rate_40ft = _derive_rate(base_rate, corridor['differential_pct'])
-
-        if rate_40ft is None:
-            logger.warning('No rate for corridor %s — skipping', corridor_code)
+    def _write_rate(
+        origin_port: str, origin_country: str,
+        destination_port: str, destination_country: str,
+        rate_40ft_hc: Decimal, source_tier: str,
+        transit_days: Optional[int],
+    ) -> None:
+        """Append-only write with dedup + is_latest demotion for one corridor."""
+        label = f'{origin_port} → {destination_port}'
+        # Skip an identical re-pull (same corridor + as_of_date + rate) so a
+        # second run on the same WCI publication day does not duplicate rows.
+        if is_duplicate_row(
+            db, OceanFreightRates,
+            {'origin_port': origin_port, 'destination_port': destination_port,
+             'as_of_date': as_of_date},
+            {'rate_40ft_hc_usd': rate_40ft_hc},
+        ):
+            logger.info('Duplicate (unchanged) %s for %s — skipping', label, as_of_date)
+            ctx.increment_rejected(f'Duplicate unchanged rate for {label} {as_of_date}')
             stats['rows_rejected'] += 1
-            ctx.increment_rejected(f'No rate for corridor {corridor_code}')
-            continue
+            return
 
-        # Build the row
-        data_notes = _build_data_notes(corridor, base_rate, as_of_date)
-
-        row = OceanFreightRates(
-            origin_port=corridor['origin_port'],
-            origin_country=corridor['origin_country'],
-            destination_port=corridor['destination_port'],
-            destination_country=corridor['destination_country'],
-            rate_20ft_usd=None,  # documented in data_notes as structural absence
-            rate_40ft_usd=None,  # WCI publishes 40HQ, not standard 40ft
-            rate_40ft_hc_usd=rate_40ft,
-            transit_days=corridor.get('transit_days_estimate'),
-            vessel_availability=None,  # documented in data_notes
-            port_congestion_index=None,  # documented in data_notes
+        mark_latest(db, OceanFreightRates, {
+            'origin_port': origin_port,
+            'destination_port': destination_port,
+        })
+        db.add(OceanFreightRates(
+            origin_port=origin_port,
+            origin_country=origin_country,
+            destination_port=destination_port,
+            destination_country=destination_country,
+            rate_20ft_usd=None,   # documented in data_notes as structural absence
+            rate_40ft_usd=None,   # WCI publishes 40HQ, not standard 40ft
+            rate_40ft_hc_usd=rate_40ft_hc,
+            transit_days=transit_days,
+            vessel_availability=None,
+            port_congestion_index=None,
             as_of_date=as_of_date,
             source=SOURCE_NAME,
             data_source_url=DREWRY_URL,
-            data_notes=data_notes,
+            data_notes=_build_data_notes(source_tier, as_of_date),
             rate_source_tier=source_tier,
-            corridor_differential_pct=(
-                Decimal(str(corridor['differential_pct']))
-                if corridor['differential_pct'] is not None else None
-            ),
-            base_corridor=corridor.get('base_drewry_corridor'),
+            corridor_differential_pct=None,
+            base_corridor=None,
             pulled_at=pulled_at,
             is_latest=1,
-        )
-
-        # Demote all prior rows for this corridor before inserting the new latest row
-        mark_latest(db, OceanFreightRates, {
-            'origin_port': corridor['origin_port'],
-            'destination_port': corridor['destination_port'],
-        })
-        db.add(row)
+        ))
         db.flush()
-
         stats['rows_inserted'] += 1
         stats['corridors_processed'] += 1
         ctx.increment_inserted()
-        logger.info(
-            'Inserted %s → %s: $%s (tier: %s)',
-            corridor['origin_port'],
-            corridor['destination_port'],
-            rate_40ft,
-            source_tier,
+        logger.info('Inserted %s: $%s (tier: %s)', label, rate_40ft_hc, source_tier)
+
+    # Real direct corridors: match config to a parsed rate by port-pair name.
+    # No hardcoded code→rate map (the old one had a phantom 'Rotterdam-New York'
+    # key that never parsed). A corridor with no parsed rate is skipped honestly.
+    for corridor in direct_corridors:
+        rate_40ft = direct_rates.get(
+            f"{corridor['origin_port']}-{corridor['destination_port']}"
+        )
+        if rate_40ft is None:
+            logger.warning(
+                'No parsed Drewry rate for direct corridor %s → %s — skipping (not fabricated)',
+                corridor['origin_port'], corridor['destination_port'],
+            )
+            stats['rows_rejected'] += 1
+            ctx.increment_rejected(
+                f"No parsed rate for {corridor['origin_port']}→{corridor['destination_port']}"
+            )
+            continue
+        _write_rate(
+            corridor['origin_port'], corridor['origin_country'],
+            corridor['destination_port'], corridor['destination_country'],
+            rate_40ft, DIRECT_TIER, corridor.get('transit_days_estimate'),
+        )
+
+    # WCI global composite — the headline freight benchmark series, stored as a
+    # sentinel "corridor" so it can feed crude→freight correlation directly.
+    if wci_composite:
+        _write_rate(
+            COMPOSITE_ORIGIN, 'Global', COMPOSITE_DESTINATION, 'Global',
+            wci_composite, COMPOSITE_TIER, None,
         )
 
     db.commit()

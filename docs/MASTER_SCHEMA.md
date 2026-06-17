@@ -37,17 +37,56 @@ Signal rule: contango_signal > 5.0 AND unhedged program → create hedge_opportu
 | Field | Type | Notes |
 |---|---|---|
 | crude_oil_id | Integer PK | |
-| brent_spot | Decimal(10,4) | |
-| wti_spot | Decimal(10,4) | |
-| 30d_trend_pct | Decimal(6,2) | |
-| days_since_refresh | Integer | Staleness counter |
+| brent_spot | Decimal(10,4) | eia_daily=RBRTE daily / fred_api=DCOILBRENTEU weekly EOP |
+| wti_spot | Decimal(10,4) | eia_daily=RWTC daily / fred_api=DCOILWTICO weekly EOP |
+| brent_wti_spread_usd | Decimal(10,4) | Brent − WTI (normally +$2-5) |
+| brent_rolling_4w_avg | Decimal(10,4) | 28-day rolling avg Brent — primary dyeing trigger signal |
+| brent_rolling_13w_avg | Decimal(10,4) | 91-day rolling avg Brent (eia_daily) — slower trend detection |
+| brent_t_minus_4w | Decimal(10,4) | Brent spot 28 days prior — the crude input price for dyeing |
+| brent_t_minus_8w | Decimal(10,4) | Brent spot 56 days prior (eia_daily) — 8-week lag hypothesis test |
+| brent_yoy_pct | Decimal(6,2) | Year-over-year % change (eia_daily) |
+| wti_brent_spread | Decimal(8,4) | WTI − Brent (eia_daily) — corridor basis (US off WTI, Asia off Brent) |
+| brent_dyeing_premium_active | Boolean | **DEPRECATED as a signal** — no longer computed at ingest. Dyeing premium is PENDING empirical calibration; CrudeCostInputs returns None until activated. |
+| brent_inr_per_barrel | Decimal(14,4) | Brent × INR/USD — Tirupur polyester cost anchor |
+| trend_30d_pct | Decimal(6,2) | 30d % change in Brent (materialized) |
+| price_anomaly_flag | Boolean | True when > 3σ from 30d rolling mean |
+| price_anomaly_sigma | Decimal(8,4) | Z-score at time of anomaly |
+| aggregation_period | Varchar(20) | "weekly_eop" / "monthly" etc. |
 | as_of_date | Date | Market date of data |
-| source | Varchar(255) | "FRED API" |
-| refresh | Varchar(50) | "daily" |
+| is_latest | Boolean | True for most-recent row per source |
+| source | Varchar(255) | "eia_daily" (primary, daily) / "fred_api" (weekly EOP) / "world_bank_pink_sheet" (monthly anchor) / "eia_petroleum_futures" (futures curve) |
 | created_at | Timestamp | |
 | updated_at | Timestamp | |
+| **Futures curve fields (source = 'eia_petroleum_futures')** | | |
+| wti_futures_1m | Decimal(10,4) | EIA RCLC1 — NYMEX WTI 1st nearby (USD/bbl) — exchange-settled |
+| wti_futures_3m | Decimal(10,4) | EIA RCLC3 — NYMEX WTI 3rd nearby — exchange-settled |
+| wti_futures_6m | Decimal(10,4) | EIA RCLC4 proxy — NYMEX WTI 4th nearby as 6m stand-in |
+| wti_futures_12m | Decimal(10,4) | EIA STEO WTIPUUS T+12 — 12-month WTI outlook |
+| brent_futures_1m | Decimal(10,4) | EIA STEO BREPUUS T+1 — **STEO forecast, NOT ICE settlement** |
+| brent_futures_3m | Decimal(10,4) | EIA STEO BREPUUS T+3 — **STEO forecast, NOT ICE settlement** |
+| brent_futures_6m | Decimal(10,4) | EIA STEO BREPUUS T+6 — **STEO forecast, NOT ICE settlement** |
+| brent_futures_12m | Decimal(10,4) | EIA STEO BREPUUS T+12 — STEO forecast unless real curve sourced |
+| brent_futures_source | Varchar(50) | "ice_yfinance" (real front-month) / "cme_delayed" (real full curve) / "steo_forecast" |
+| brent_futures_is_market_price | Boolean | True if a real market settlement, False if STEO forecast |
+| brent_futures_delay_minutes | Integer | 0 settlement, 15 delayed, NULL for STEO |
 
-Signal rule: brent_spot > 85.0 → flag dyeing_cost_pressure on dark colour programs
+> **NOTE — Brent forward provenance.** Free real-market sources cover only the front-month
+> (Yahoo `BZ=F`, real ICE settlement). The 3m/6m/12m term structure has no free real-market
+> source (CME bot-blocks; Yahoo carries no monthly Brent contracts), so those tenors remain
+> EIA STEO forecast (is_market_price=False). When only the front-month is real, the row's
+> brent_contango_signal and crude_market_structure are NULLed — a single real tenor against a
+> STEO 12m is not a valid market structure (no mixed-source spread is stored).
+> Forward confidence: **0.85** for a real market tenor, **0.55** (STEO_CONFIDENCE_CAP) for forecast.
+> WTI tenors (RCLC1-4) are exchange-traded settlement prices and carry no such cap for short tenors.
+| **Signal fields** | | |
+| wti_contango_signal | Decimal(6,4) | (RCLC4 − RCLC1) / RCLC1 × 100 — authoritative market structure |
+| brent_contango_signal | Decimal(6,4) | Proxy = wti_contango_signal (no Brent NYMEX futures from EIA) |
+| crude_market_structure | Varchar(20) | "contango" / "backwardation" / "flat" — from NYMEX spread |
+| data_quality_flag | Varchar(50) | e.g. "DEVIATION_FLAGGED" |
+| data_quality_note | Text | Human-readable note from deviation audit |
+
+Signal rule: PENDING CALIBRATION — crude price data is live and stored. The dyeing cost transmission coefficient requires empirical calibration from RRK invoice data (n≥20, R²≥0.40, p<0.01) before any dyeing signal fires. Until then CrudeCostInputs.get_dyeing_pressure() returns dyeing_premium_active=None with calibration_status='PENDING'.
+Signal rule: crude_market_structure = 'contango' AND polyester exposure → hedge_opportunity_recommendation (fires only on a full consistent real or STEO curve; NULL structure on a partial-real curve does not fire)
 
 ### px_paraxylene
 | Field | Type | Notes |
@@ -1019,16 +1058,16 @@ The 15 tables with their primary FK:
 This is the order in which the cost engine must compute. Do not skip steps.
 
 1. cotton.spot_price → yarn.price_per_kg (lag 4–8 weeks, confidence-weighted)
-2. crude_oil.brent_spot → dyeing chemical premium (above $85/bbl threshold)
+2. crude_oil.brent_spot → dyeing chemical premium (PENDING CALIBRATION — no signal until empirically calibrated from RRK invoices; returns None)
 3. yarn.price_per_kg + knitting labour + dyeing premium → knit_fabric.price_per_kg
 4. knit_fabric.price_per_kg × GSM conversion → fabric_cost_doz
 5. labour_cost_by_country[corridor] × hours_per_dozen → cmt_cost_doz
 6. trim_cost.total_trim_cost_doz → trim_cost_doz
-7. energy_cost[corridor] × kWh_per_dozen → overhead_doz component
+7. energy_cost[corridor] × kWh_per_dozen → overhead_doz component  *(CRUDE_LINKAGE_PENDING: no crude multiplier — static reference only until RRK energy invoices calibrated)*
 8. factory_financing_cost[corridor] × payment_days / 365 × fob_approx → financing_cost_doz
 9. Sum all components → fob_price_doz
 10. fx_rates[corridor] → convert all costs to USD
-11. ocean_freight_rates[route] / dozens_per_container → freight_cost_doz
+11. ocean_freight_rates[route] / dozens_per_container → freight_cost_doz  *(CRUDE_LINKAGE_PENDING: no crude bunker surcharge — static reference only until Drewry WCI live and BAF empirically calibrated)*
 12. us_duty_rates.ntr_rate × fob_price_doz → duty_cost_doz
 13. Sum FOB + freight + duty + insurance → landed_cost_doz
 14. Write to current_landed_cost_per_dozen with as_of_date and model_version
@@ -1042,8 +1081,88 @@ This is the order in which the cost engine must compute. Do not skip steps.
 | FX rates (ExchangeRate-API) | LIVE | — |
 | WASDE (USDA FAS) | LIVE | — |
 | Commodity futures (ICE) | LIVE | — |
-| Crude oil (FRED) | PARTIAL — stale | Fix refresh schedule |
+| Crude oil spot (EIA daily) | LIVE — daily resolution, 1987→present | primary |
+| Crude oil spot (FRED weekly) | LIVE — weekly EOP | secondary |
+| Crude oil spot (Pink Sheet) | LIVE — monthly anchor | reference |
+| Crude oil futures (Brent ICE) | LIVE — real front-month (yfinance BZ=F); 3m/6m/12m STEO fallback | — |
+| Crude oil futures (WTI NYMEX) | LIVE — EIA RCLC series | — |
+| Crude transmission calibration | PENDING — 0/20 invoice pairs | activates at n≥20, R²≥0.40, p<0.01 |
+| Dyeing premium signal | PENDING CALIBRATION | returns None until activated |
+| Energy cost crude linkage | NOT BUILT — pending RRK energy invoices | add after factory data |
+| Freight bunker crude linkage | NOT BUILT — pending Drewry WCI | add after live freight data |
 | Yarn costs | NOT CONNECTED | #1 priority — Tirupur DB |
 | Ocean freight | NOT CONNECTED | #2 priority — Drewry WCI |
 | Carrier network | NOT CONNECTED | #3 priority — sign up forwarders |
 | Factory OTD data | DEMO ONLY | #4 priority — real factory data |
+
+---
+
+## CRUDE OIL SIGNAL ROUTING
+
+All crude data flows through `intelligence.crude_cost_inputs.CrudeCostInputs`. Direct `crude_oil` table queries are prohibited in the cost engine and intelligence layer.
+
+### Source hierarchy (authority order)
+1. **eia_daily** — daily resolution. Use for transmission-calibration joins (exact invoice-date match).
+2. **fred_api** — weekly EOP. Use for rolling averages and operational trend signals.
+3. **world_bank_pink_sheet** — monthly anchor. Historical analysis only.
+4. **eia_petroleum_futures** — forward curve.
+
+### Entry Points (CrudeCostInputs)
+
+| Method | Returns | Cost Engine Use |
+|---|---|---|
+| `get_spot_input(as_of_date)` | brent_t4w, brent_rolling_avg, dyeing_premium_active=**None**, source_row_id | Cost step 2: dyeing chemical premium |
+| `get_forward_input(delivery_date, as_of_date)` | brent_futures, wti_futures, market_structure, brent_forward_source, brent_forward_is_market_price, confidence | Cost step 14: forward landed cost |
+| `get_dyeing_pressure(as_of_date)` | raw crude prices + dyeing_premium_active=**None**, calibration_status=**'PENDING'** | Dark-colour program alerts |
+
+**What CrudeCostInputs does NOT compute (pending data — no approximation):**
+- Energy cost adjustment (step 7) → requires RRK energy invoices. `# CRUDE_LINKAGE_PENDING` in engine.py.
+- Bunker surcharge (step 11) → requires Drewry WCI live feed. `# CRUDE_LINKAGE_PENDING` in engine.py.
+- Dyeing premium → requires n≥20 validated invoice pairs. Returns None until calibration activates.
+
+`get_energy_cost_adjustment()` and `get_freight_bunker_adjustment()` were **removed entirely** — they were uncalibrated industry formulas (12% energy sensitivity; $8.50/container BAF). Wrong data is worse than no data.
+
+### Tenor Selection (get_forward_input)
+| Days to delivery | Tenor | Confidence |
+|---|---|---|
+| ≤ 30d | 1m | 0.85 if real ICE (ice_yfinance/cme_delayed), else 0.55 (STEO) |
+| ≤ 90d | 3m | 0.55 (STEO) until a real term structure is sourced |
+| ≤ 180d | 6m | 0.55 (STEO) |
+| > 180d | 12m | 0.55 (STEO) |
+
+### Signal Flow
+```
+EIA RBRTE/RWTC daily → brent_rolling_4w_avg / rolling_13w / t_minus_4w / t_minus_8w / yoy / wti_brent_spread
+EIA NYMEX RCLC1-4    → wti_contango_signal → crude_market_structure
+Yahoo BZ=F (real)    → brent_futures_1m (is_market_price=True, conf 0.85)
+crude price (live)   → get_dyeing_pressure() → dyeing_premium_active = None (PENDING CALIBRATION)
+crude_market_structure = contango (full consistent curve) → hedge_opportunity_recommendation (synthesis)
+```
+
+### Quality Gate
+`get_blocking_failures()` is called at the start of every `CostReasoningEngine.reason()` call.
+It returns the **most recent** result per check and blocks only on the four BLOCKING checks
+(`daily_increment_check`, `source_reconciliation_check`, `futures_curve_integrity_check`,
+`eia_daily_coverage_check`) whose latest result is an unresolved `fail`. Non-blocking checks
+(`sigma_anomaly_check`, `wti_brent_spread_sanity_check`, `calibration_readiness_check`) never block.
+
+### Transmission Calibration (engine: `intelligence/transmission_calibration.py`)
+Runs daily, idempotent. Joins fabric_dyeing invoices to **eia_daily** crude at 4w/8w lag.
+Activation requires ALL of: **n≥20, R²≥0.40, p<0.01, positive coefficient, 95% CI excludes zero.**
+Empirical threshold is found by **Chow test** (structural break), not assumed at $85/bbl.
+Status (2026-06-16): **PENDING — 0/20 invoice pairs.**
+
+Until activated: `dyeing_premium_active` returns None.
+After activated: `dyeing_premium_active = (brent_t_minus_{lag_weeks}w > empirical_threshold)`,
+coefficient and threshold drawn from `crude_transmission_calibration`.
+
+### Crude × Retailer Composite Signal
+`synthesis.get_crude_retailer_demand_composite(db, as_of_date)`. Returns a non-predictive composite
+of crude pressure level + retailer demand health **only when** eia_daily < 7 days old AND
+demand_signals < 90 days old; otherwise components are None and `data_complete=False`.
+Does not write to any output table; does not make predictions or recommendations.
+
+### PROHIBITED in cost engine code
+- Direct queries to the `crude_oil` table (everything via CrudeCostInputs).
+- Any hardcoded threshold ($85 or otherwise).
+- Any approximation formula for energy or freight crude adjustment.
