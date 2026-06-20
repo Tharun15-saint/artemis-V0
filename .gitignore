@@ -1,10 +1,15 @@
-# Medallion Layer 1 — immutable raw payload store (content-addressable blobs).
-# The DB manifest (raw_artifact) is the source of truth; the bytes live here and
-# must never enter git (large, and may contain proprietary RRK source documents).
-raw_store/
+# NOTE: by the owner's explicit decision (full rights to the data), buyer-confidential
+# SOURCE DOCUMENTS (tech packs, costing sheets, yarn data, images, masters) ARE
+# committed to this PRIVATE repository for durable backup. Only secrets and files that
+# are oversized/re-creatable are excluded below.
 
-# Database — never upload this (Postgres/Timescale is the source of truth now;
-# SQLite files are kept locally only as a migration rollback)
+# Secrets — NEVER commit (real API keys: FMP, FRED, etc.)
+.env
+.env.local
+*.env
+
+# SQLite databases — old rollback copies; large (>100MB, exceed GitHub limit);
+# Postgres/Timescale is the source of truth now.
 *.db
 *.db-shm
 *.db-wal
@@ -12,18 +17,19 @@ raw_store/
 *.sqlite
 *.sqlite3
 
-# Environment variables and API keys — never upload
-.env
-.env.local
-*.env
+# DB dumps / data-backup snapshots — re-creatable from sources+scripts, and some
+# exceed GitHub's 100MB per-file hard limit (e.g. the 144MB full dump).
+backups/
 
-# Python cache
+# Medallion Layer-1 raw blob store — system-managed, content-addressable cache;
+# reconstructable, and duplicates the human-readable docs already in data/reference/.
+raw_store/
+
+# Python cache / virtualenv
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
-
-# Virtual environment
 venv/
 env/
 .venv/
@@ -31,28 +37,6 @@ env/
 # OS files
 .DS_Store
 Thumbs.db
-
-# Cursor AI files (optional — keep if you want)
-# .cursor/
-
-# Large / proprietary data files — source documents (tech packs, costing sheets,
-# yarn data, RRK invoices) stay LOCAL only; many are buyer-confidential (Walmart).
-# Keep them out of git; back them up externally instead. See data/reference/REFERENCE_MANIFEST.md
-*.xlsx
-*.xls
-*.xlsm
-*.pdf
-*.csv
-# Images (tech-pack photos etc. — data, often confidential)
-*.jpg
-*.jpeg
-*.png
-*.webp
-*.gif
-
-# Database dumps / data backups — never commit (large data; re-creatable)
-*backup*.sql
-*.dump
 
 # Logs
 *.log
