@@ -190,6 +190,14 @@ class RetailerIntelligenceExtract(Base):
     pulled_at               = Column(DateTime, nullable=False, server_default=func.now())
     is_latest               = Column(Boolean, nullable=False, default=True, server_default="1")
     excluded_reason         = Column(String(500))
+    # v5.0 turn-anchoring (Layer-2 transcript_turn): capture-all + tag + provenance to raw L1
+    relevance_tier          = Column(String(30))   # apparel_direct|apparel_adjacent|consumer_macro|strategy|operations|other
+    source_turn_index       = Column(Integer)      # → transcript_turn.turn_index
+    quote_char_start        = Column(Integer)      # raw_text_passage == raw_content[quote_char_start:quote_char_end]
+    quote_char_end          = Column(Integer)
+    replies_to_turn_index   = Column(Integer)      # analyst Q this answer addresses (Q↔A context)
+    dedup_cluster_id        = Column(BigInteger)   # groups same-fact near-duplicates (NULL = singleton)
+    is_canonical            = Column(Boolean, nullable=False, default=True, server_default="1")  # best member of cluster
     created_at              = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at              = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -257,3 +265,40 @@ class RetailerStockPrices(Base):
     is_latest        = Column(Boolean, nullable=False, default=True, server_default="1")
     created_at       = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at       = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class TranscriptTurn(Base):
+    """Spoken-signal Layer 2 — the structured transcript: one row per speaker turn, built
+    deterministically from the immutable raw L1 (raw_artifact). The COMPLETE, addressable call.
+
+    char_start/char_end are offsets into the raw `content`, so concatenating turns in order
+    reconstructs the raw byte-for-byte, and any extracted signal can prove it is a literal slice
+    of the raw (faithfulness BY CONSTRUCTION). Append-only/temporal: one is_latest row per
+    (retailer, fiscal_year, fiscal_quarter, source, turn_index); re-structuring demotes the prior.
+    """
+    __tablename__ = "transcript_turn"
+    transcript_turn_id    = Column(BigInteger, primary_key=True, autoincrement=True)
+    retailer_id           = Column(Integer)          # FK → major_retailers
+    fiscal_year           = Column(Integer, nullable=False)
+    fiscal_quarter        = Column(Integer, nullable=False)
+    period_end_date       = Column(Date)
+    source                = Column(String(40), nullable=False)
+    content_sha256        = Column(String(64))        # → raw_artifact (immutable L1)
+    source_url            = Column(String(500))
+    turn_index            = Column(Integer, nullable=False)   # 0-based order within the call
+    section               = Column(String(20))        # prepared_remarks | qa
+    speaker_name          = Column(String(160))
+    speaker_role          = Column(String(20))        # CEO|CFO|IR|management|analyst|operator|other
+    speaker_firm          = Column(String(160))       # analyst's firm, when known
+    speaker_title         = Column(String(200))
+    char_start            = Column(Integer, nullable=False)
+    char_end              = Column(Integer, nullable=False)
+    verbatim_text         = Column(Text, nullable=False)   # == raw_content[char_start:char_end]
+    word_count            = Column(Integer)
+    is_question           = Column(Boolean)
+    replies_to_turn_index = Column(Integer)           # analyst Q this management turn answers
+    source_format         = Column(String(30))
+    is_latest             = Column(Boolean, nullable=False, default=True, server_default="1")
+    pulled_at             = Column(DateTime, nullable=False, server_default=func.now())
+    created_at            = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at            = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)

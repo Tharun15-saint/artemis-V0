@@ -128,12 +128,16 @@ def validate_retailer_revenue(
     revenue_usd: float,
     retailer_name: str,
 ) -> tuple[bool, str]:
+    # Gross-error tripwires only (catch a 10x/sign/parse error), NOT tight expectations:
+    # the bounds must never reject a legitimate SEC-sourced quarter across the full history
+    # we ingest. Walmart quarterly net sales span ~$93B (FY2009) → ~$181B (recent) and grow;
+    # Target ~$15B → ~$31B. Nulling a verified value is worse than letting a tripwire be wide.
     QUARTERLY_RANGES = {
-        "Walmart Inc": (140e9, 220e9),
-        "Target Corporation": (20e9, 40e9),
-        "TJX Companies": (10e9, 20e9),
-        "Burlington": (1e9, 4e9),
-        "Ross Stores": (4e9, 10e9),
+        "Walmart Inc": (80e9, 260e9),
+        "Target Corporation": (12e9, 45e9),
+        "TJX Companies": (5e9, 25e9),
+        "Burlington": (0.5e9, 5e9),
+        "Ross Stores": (2e9, 12e9),
     }
     if revenue_usd is None:
         return True, ""
@@ -179,7 +183,7 @@ def validate_walmart_general_merch(revenue_usd: float) -> tuple[bool, str]:
         return True, ""
     if revenue_usd < 20e9 or revenue_usd > 40e9:
         return False, (
-            f"walmart_general_merch: ${revenue_usd/1e9:.1f}B "
+            f"walmart_general_merch: ${float(revenue_usd)/1e9:.1f}B "
             f"outside expected $20B–$40B"
         )
     return True, ""
@@ -190,7 +194,7 @@ def validate_sams_club_apparel(revenue_usd: float) -> tuple[bool, str]:
         return True, ""
     if revenue_usd < 1.5e9 or revenue_usd > 4e9:
         return False, (
-            f"sams_club_home_apparel: ${revenue_usd/1e9:.2f}B "
+            f"sams_club_home_apparel: ${float(revenue_usd)/1e9:.2f}B "
             f"outside expected $1.5B–$4B"
         )
     return True, ""

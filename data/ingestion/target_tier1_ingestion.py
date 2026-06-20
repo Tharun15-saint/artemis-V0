@@ -46,9 +46,15 @@ QUARTER_FETCH_COUNT = 5
 QUARTER_OUTPUT_COUNT = 4
 MILLIONS = Decimal("1000000")
 
+# Net-sales-first, MERCHANDISE-first — must mirror the SEC reconciliation gate's TGT chain
+# (retail_financials_reconcile.RETAILER_PROFILES["TGT"]["revenue"]). Target's demand figure is
+# merchandise SalesRevenueGoodsNet; the ASC 606 RevenueFromContract... (total revenue) is only a
+# late fallback, used for the post-2018 quarters where the merchandise concepts no longer appear.
+# Keeping this identical to the gate means what we ingest is what the gate verifies, by construction.
 REVENUE_CONCEPTS = [
-    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "SalesRevenueGoodsNet",
     "SalesRevenueNet",
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
     "Revenues",
 ]
 COGS_CONCEPTS = [
@@ -244,6 +250,34 @@ def _fiscal_key(fy: int, fp: str) -> tuple[int, int]:
     return fy, _fp_to_int(fp) or 0
 
 
+def _fiscal_quarter_from_end(end_date: date) -> Optional[tuple[int, int]]:
+    """Derive (fiscal_year, fiscal_quarter) from a period-END date for Target's 4-4-5 calendar
+    (fiscal-year-end the Saturday nearest Jan 31, so quarter-ends drift across late-Jan/early-
+    Feb, late-Apr/early-May, etc.) — DETERMINISTICALLY, never SEC's `fy`/`fp` tags.
+
+    SEC's tags drift: a prior-year comparative is re-tagged with the filer's current fy, and the
+    fiscal-year-focus lagged a year in some eras — e.g. SEC tags the 2022-10-29 quarter fy=2023,
+    colliding it with the real FY2023 Q3 and silently dropping FY2022 Q3. Anchoring on the end
+    date is collision-free and matches Target's own labelling for every era.
+
+    Target names a fiscal year for the calendar year it mostly spans: FY_N runs ~Feb_N …
+    Jan/early-Feb_{N+1} (the year ending Feb 3 2018 is Target 'fiscal 2017'). Quarter by end
+    month: Mar-May=Q1, Jun-Aug=Q2, Sep-Nov=Q3, Dec-Feb=Q4; fy = end.year for Q1-Q3 (and a Dec
+    Q4), else end.year-1 for a Jan/Feb Q4."""
+    m = end_date.month
+    if m in (3, 4, 5):
+        return end_date.year, 1
+    if m in (6, 7, 8):
+        return end_date.year, 2
+    if m in (9, 10, 11):
+        return end_date.year, 3
+    if m == 12:
+        return end_date.year, 4
+    if m in (1, 2):
+        return end_date.year - 1, 4
+    return None
+
+
 def _collect_us_gaap_entries(
     us_gaap: dict[str, Any],
     concept_names: list[str],
@@ -278,78 +312,57 @@ def _extract_fiscal_quarter_maps(
     """Build fiscal-quarter keyed maps from XBRL company facts."""
 
     def duration_map(concepts: list[str]) -> dict[tuple[int, int], Decimal]:
-        candidates: dict[tuple[int, int], dict[str, Any]] = {}
-        for entry in _collect_us_gaap_entries(us_gaap, concepts):
-            fp = entry.get("fp")
-            fy = entry.get("fy")
-            end = entry.get("end")
-            if fp not in ("Q1", "Q2", "Q3", "Q4") or fy is None or not end:
+        # Key by (fiscal_year, fiscal_quarter) derived from the period-END date, never SEC's
+        # drifting `fy`/`fp` tags. Only a discrete ~quarter duration (80-100 days, incl. a
+        # 14-week quarter in 53-week years) qualifies, so a YTD cumulative can't masquerade as a
+        # quarter. Value selection MIRRORS the reconciliation gate's duration_facts_by_end
+        # EXACTLY — concept priority (list order) wins, then the later-filed value supersedes a
+        # restatement (no `has_frame` preference, which would pick a re-presented variant) — so
+        # what we ingest is what the SEC-truth gate verifies, by construction.
+        out: dict[tuple[int, int], Decimal] = {}
+        chosen: dict[tuple[int, int], tuple[int, str]] = {}
+        for rank, concept in enumerate(concepts):
+            node = us_gaap.get(concept)
+            if not node:
                 continue
-            frame = entry.get("frame") or ""
-            if frame.endswith("I"):
-                continue
-            if entry.get("val") is None:
-                continue
-            key = _fiscal_key(int(fy), fp)
-            end_date = date.fromisoformat(str(end))
-            start_date = (
-                date.fromisoformat(str(entry["start"]))
-                if entry.get("start")
-                else None
-            )
-            duration_days = (
-                (end_date - start_date).days if start_date else 999
-            )
-            has_frame = bool(frame and _parse_quarter_frame(frame))
-            current = candidates.get(key)
-            if current is None:
-                candidates[key] = {
-                    "val": Decimal(str(entry["val"])),
-                    "end": end_date,
-                    "has_frame": has_frame,
-                    "duration_days": duration_days,
-                }
-                continue
-            if end_date > current["end"]:
-                replace = True
-            elif end_date < current["end"]:
-                replace = False
-            elif has_frame and not current["has_frame"]:
-                replace = True
-            elif current["has_frame"] and not has_frame:
-                replace = False
-            elif duration_days < current["duration_days"]:
-                replace = True
-            else:
-                replace = False
-            if replace:
-                candidates[key] = {
-                    "val": Decimal(str(entry["val"])),
-                    "end": end_date,
-                    "has_frame": has_frame,
-                    "duration_days": duration_days,
-                }
-        return {key: data["val"] for key, data in candidates.items()}
+            for unit_vals in node.get("units", {}).values():
+                if not isinstance(unit_vals, list):
+                    continue
+                for fact in unit_vals:
+                    start, end, val = fact.get("start"), fact.get("end"), fact.get("val")
+                    if not start or not end or val is None:
+                        continue
+                    end_date = date.fromisoformat(str(end))
+                    if not (80 <= (end_date - date.fromisoformat(str(start))).days <= 100):
+                        continue
+                    key = _fiscal_quarter_from_end(end_date)
+                    if key is None:
+                        continue
+                    filed = str(fact.get("filed") or "")
+                    prior = chosen.get(key)
+                    if prior is None or rank < prior[0] or (rank == prior[0] and filed > prior[1]):
+                        out[key] = Decimal(str(val))
+                        chosen[key] = (rank, filed)
+        return out
 
     def instant_map(concepts: list[str]) -> dict[tuple[int, int], Decimal]:
+        # Key balance-sheet instants by (fiscal_year, fiscal_quarter) derived from the instant's
+        # OWN date (_fiscal_quarter_from_end) — never the calendar XBRL frame (which shifts a
+        # year for retailers whose fiscal year is offset from the calendar) and never SEC's
+        # `fy`/`fp` tags. On a restatement (same date, refiled), the later-filed value wins.
         result: dict[tuple[int, int], Decimal] = {}
+        chosen_filed: dict[tuple[int, int], str] = {}
         for entry in _collect_us_gaap_entries(us_gaap, concepts):
-            fp = entry.get("fp")
-            fy = entry.get("fy")
             end = entry.get("end")
-            if fy is None or not end or entry.get("val") is None:
+            if not end or entry.get("val") is None:
                 continue
-            frame = entry.get("frame") or ""
-            key: Optional[tuple[int, int]] = None
-            if frame.endswith("I"):
-                key = _parse_quarter_frame(frame)
-            if key is None and fp in ("Q1", "Q2", "Q3", "Q4"):
-                key = _fiscal_key(int(fy), fp)
+            key = _fiscal_quarter_from_end(date.fromisoformat(str(end)))
             if key is None:
                 continue
-            val = Decimal(str(entry["val"]))
-            if key not in result or frame.endswith("I"):
-                result[key] = val
+            filed = str(entry.get("filed") or "")
+            if key not in result or filed > chosen_filed.get(key, ""):
+                result[key] = Decimal(str(entry["val"]))
+                chosen_filed[key] = filed
         return result
 
     revenue = duration_map(REVENUE_CONCEPTS)
@@ -362,62 +375,44 @@ def _extract_fiscal_quarter_maps(
 
     meta: dict[tuple[int, int], dict[str, Any]] = {}
     for entry in _collect_us_gaap_entries(us_gaap, REVENUE_CONCEPTS):
-        fp = entry.get("fp")
-        fy = entry.get("fy")
-        if fp not in ("Q1", "Q2", "Q3", "Q4") or fy is None or not entry.get("end"):
+        end = entry.get("end")
+        start = entry.get("start")
+        if not end or not start:
             continue
-        key = _fiscal_key(int(fy), fp)
-        if key not in revenue:
+        end_date = date.fromisoformat(str(end))
+        duration_days = (end_date - date.fromisoformat(str(start))).days
+        if not (80 <= duration_days <= 100):           # discrete quarter only
             continue
-        end_date = date.fromisoformat(str(entry["end"]))
-        start_date = (
-            date.fromisoformat(str(entry["start"])) if entry.get("start") else None
-        )
-        duration_days = (end_date - start_date).days if start_date else 999
+        key = _fiscal_quarter_from_end(end_date)
+        if key is None or key not in revenue:
+            continue
         frame = entry.get("frame") or ""
         has_frame = bool(frame and _parse_quarter_frame(frame))
+        record = {
+            "fiscal_year": key[0],
+            "fiscal_quarter": key[1],
+            "period_end_date": end_date,
+            "filing_date": (
+                date.fromisoformat(str(entry["filed"])) if entry.get("filed") else None
+            ),
+            "accession": entry.get("accn"),
+            "duration_days": duration_days,
+            "has_frame": has_frame,
+        }
         current = meta.get(key)
         if current is None:
-            meta[key] = {
-                "fiscal_year": int(fy),
-                "fiscal_quarter": _fp_to_int(fp),
-                "period_end_date": end_date,
-                "filing_date": (
-                    date.fromisoformat(str(entry["filed"]))
-                    if entry.get("filed")
-                    else None
-                ),
-                "accession": entry.get("accn"),
-                "duration_days": duration_days,
-                "has_frame": has_frame,
-            }
+            meta[key] = record
             continue
-        if end_date > current["period_end_date"]:
-            replace = True
-        elif end_date < current["period_end_date"]:
-            replace = False
-        elif has_frame and not current["has_frame"]:
+        # all entries for a key share one end date; prefer a framed quarterly tag, then the
+        # shortest duration.
+        if has_frame and not current["has_frame"]:
             replace = True
         elif current["has_frame"] and not has_frame:
             replace = False
-        elif duration_days < current["duration_days"]:
-            replace = True
         else:
-            replace = False
+            replace = duration_days < current["duration_days"]
         if replace:
-            meta[key] = {
-                "fiscal_year": int(fy),
-                "fiscal_quarter": _fp_to_int(fp),
-                "period_end_date": end_date,
-                "filing_date": (
-                    date.fromisoformat(str(entry["filed"]))
-                    if entry.get("filed")
-                    else None
-                ),
-                "accession": entry.get("accn"),
-                "duration_days": duration_days,
-                "has_frame": has_frame,
-            }
+            meta[key] = record
 
     for key in list(revenue.keys()):
         if key not in meta:

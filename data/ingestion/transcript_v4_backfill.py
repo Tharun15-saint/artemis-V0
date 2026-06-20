@@ -78,6 +78,9 @@ MANUAL_URL_OVERRIDES: dict[tuple[int, int, int], str] = {
     (1, 2025, 3): "https://www.insidermonkey.com/blog/target-corporation-nysetgt-q3-2025-earnings-call-transcript-1648382/",
     (1, 2021, 1): "https://www.fool.com/earnings/call-transcripts/2021/05/19/target-tgt-q1-2021-earnings-call-transcript/",
     (1, 2020, 4): "https://www.fool.com/earnings/call-transcripts/2021/03/02/target-tgt-q4-2020-earnings-call-transcript/",
+    # Single-quarter feasibility test for the OLDER (.aspx) format — WMT FY2019 Q3
+    # (fool labels it "Q3 2018" = calendar year of the call). Fetch already verified.
+    (2, 2019, 3): "https://www.fool.com/earnings/call-transcripts/2018/11/15/walmart-inc-wmt-q3-2018-earnings-conference-call-t.aspx",
 }
 
 # Quarters whose earnings call happened but have NO extractable transcript anywhere.
@@ -108,7 +111,7 @@ _QUARTERS_SQL = """
 _V4_DONE_SQL = """
     SELECT DISTINCT retailer_id, fiscal_year, fiscal_quarter
     FROM retailer_intelligence_extract
-    WHERE extraction_prompt_ver = 'v4.0' AND is_latest = 1
+    WHERE extraction_prompt_ver = 'v4.0' AND is_latest
 """
 
 
@@ -116,7 +119,7 @@ def _period_end_for(db, rid: int, fy: int, fq: int) -> Optional[str]:
     row = db.execute(
         text(
             "SELECT period_end_date FROM retailer_financials "
-            "WHERE retailer_id=:r AND fiscal_year=:y AND fiscal_quarter=:q AND is_latest=1 LIMIT 1"
+            "WHERE retailer_id=:r AND fiscal_year=:y AND fiscal_quarter=:q AND is_latest LIMIT 1"
         ),
         {"r": rid, "y": fy, "q": fq},
     ).fetchone()
@@ -227,7 +230,7 @@ def run(retailer_id=None, fy=None, fq=None, dry_run=False, force=False) -> dict:
             avg = db.execute(
                 text(
                     "SELECT CAST(ROUND(AVG(c)) AS INT) FROM (SELECT COUNT(*) c FROM "
-                    "retailer_intelligence_extract WHERE is_latest=1 AND period_end_date>=:s "
+                    "retailer_intelligence_extract WHERE is_latest AND period_end_date>=:s "
                     "GROUP BY retailer_id, fiscal_year, fiscal_quarter)"
                 ),
                 {"s": BACKFILL_START},
@@ -274,6 +277,18 @@ def run(retailer_id=None, fy=None, fq=None, dry_run=False, force=False) -> dict:
                 logger.error("FAIL %s — %s — skipping", lbl, reason)
                 results["failed"] += 1
             else:
+                # HARD GATE: prove this transcript IS this quarter, verified against SEC
+                # truth (fiscal period + call date + EPS/revenue/comp), before extracting.
+                from data.verification.verify_transcript_source import verify_source
+                v = verify_source(db, q["retailer_id"], q["fiscal_year"], q["fiscal_quarter"], url, txt=txt)
+                if v["verdict"] != "VERIFIED":
+                    failed_checks = [k for k, ok in v["checks"].items() if not ok]
+                    logger.error("FAIL %s — source NOT verified vs SEC truth (%s); failed: %s — skipping",
+                                 lbl, v["verdict"], failed_checks)
+                    results["failed"] += 1
+                    if i < len(to_process) - 1:
+                        time.sleep(BETWEEN_TRANSCRIPT_SLEEP)
+                    continue
                 try:
                     stats = process_transcript(
                         txt, retailer_id=q["retailer_id"], fiscal_year=q["fiscal_year"],

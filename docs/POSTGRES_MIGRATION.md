@@ -115,13 +115,38 @@ enforces them, which surfaced 11 columns to correct (now fixed in the models):
   (they had no model in SQLite either). Either add models for them or add them to
   the Alembic ignore list.
 
-## Known follow-up: the `cotton_macro_features_v` view
+## SQL views: DONE
 
-The SQLite view `cotton_macro_features_v` uses SQLite-only functions
-(`strftime`, `JULIANDAY`, boolean-as-`0/1`) and is **not** migrated by the data
-script. It must be re-created as a Postgres-native view (translate `strftime` →
-`EXTRACT`, `JULIANDAY(a)-JULIANDAY(b)` → `a::date - b::date`, `is_latest = 1` →
-`is_latest`). Tracked as a separate task.
+Views are derived objects (stored queries, no data), so they are created by
+neither Alembic nor the data migration. They live in `database/views/*.sql` and
+are applied with:
+
+```bash
+python scripts/apply_views.py        # honors .env DATABASE_URL; re-runnable
+```
+
+`cotton_macro_features_v` (the cotton macro model training view, 783 rows × 66
+columns) has been **fully translated to PostgreSQL-native SQL**:
+
+- `strftime('%m'|'%Y', d)` → `EXTRACT(MONTH|YEAR FROM d)::int`
+- `strftime('%W', d)` → Monday-anchored week number, replicated exactly
+  (verified equal to Python `strftime('%W')` on all 783 rows + 253 year-boundary
+  dates)
+- `JULIANDAY(a) - JULIANDAY(b)` → `(a - b)` (DATE minus DATE = integer days)
+- `is_latest = 1` → `is_latest = true` (real boolean now)
+- Every "most-recent within N days" subquery got a primary-key tie-breaker
+  (`ORDER BY <date> DESC, <pk> DESC`) so selection is **deterministic even if
+  `is_latest` is ever over-set again**. On clean data this is a no-op (verified:
+  identical content hash before/after adding it).
+
+Cross-engine validation: the Postgres view was diffed cell-by-cell against the
+original SQLite view. All differences reduce to (a) Postgres enforcing declared
+`Numeric` scale, same class as the string-length fixes above, and (b) 27 month-end
+weeks where crude columns differ **because the live Postgres `crude_oil` has had
+its `is_latest` repaired** (0 dates with duplicate "latest" rows) while the frozen
+SQLite snapshot still has the old over-set bug (68 such dates). The Postgres view
+is therefore reading the *corrected* data — it is more correct than the old one,
+not less.
 
 ## Production notes
 

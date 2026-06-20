@@ -19,7 +19,9 @@ from .retail import (
     RetailerIntelligenceExtract,
     RetailerSignalEvidence,
     RetailerStockPrices,
+    TranscriptTurn,
 )
+from .retail_metrics import MetricDefinition, RetailerMetric, MetricInterpretation
 from .reference_seed import (
     GeopoliticalRiskEvent,
     GovernmentExportIncentive,
@@ -92,6 +94,9 @@ from .outputs import (CurrentLandedCostPerDozen, ForwardLandedCost90Day,
 from .prediction import PredictionLog
 from .revenue import RevenueTransaction, IntelligenceSubscription, DataLicensingRevenue
 from .ingestion_log import IngestionLog
+
+# ── Medallion Layer 1: immutable raw capture ─────────────────────────────────
+from .raw_capture import RawIngestRun, RawArtifact
 
 # ── Reconciled tables (previously DB-only, now first-class ORM models) ────────
 from .reconciled_tables import (

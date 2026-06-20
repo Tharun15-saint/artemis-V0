@@ -111,14 +111,22 @@ class TestSchemaGuardian:
         assert not missing, f"commodity_futures missing tenor fields: {missing}"
 
     def test_every_table_has_timestamps(self):
-        """Every table must have created_at and updated_at."""
+        """Every table must have created_at and updated_at.
+
+        raw_artifact is exempt from updated_at by design: it is the immutable, append-only
+        medallion L1 layer (it carries created_at + captured_at, never updated_at — the
+        absence of an update path IS the immutability guarantee).
+        """
         exempt = {"alembic_version"}
+        updated_at_exempt = {"raw_artifact"}
         failures = []
         for table_name in self.db_tables - exempt:
             db_columns = {
                 col["name"] for col in self.inspector.get_columns(table_name)
             }
             for ts_col in ["created_at", "updated_at"]:
+                if ts_col == "updated_at" and table_name in updated_at_exempt:
+                    continue
                 if ts_col not in db_columns:
                     failures.append(f"{table_name} missing {ts_col}")
         assert not failures, (
